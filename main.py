@@ -1,7 +1,8 @@
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.optimize import curve_fit
+
 from datetime import datetime, timedelta
 from MET_Secrets import client_ID, secret_ID
 
@@ -46,7 +47,7 @@ def cleanTemperatureData(data):
     
     lower = -25
     upper = 40
-    errors = [-127, 85]
+    errors = [-127, 85, 0]
     
     cleansedData = []
     for value in data:
@@ -63,13 +64,15 @@ def cleanLightData(data):
     upper = 100_000
     errors = []
     
+
+    
     cleansedData = []
     for value in data:
         invalid = \
             (value in errors) or \
-            value <= lower or \
-            upper <= value or \
-            value is not None
+            value < lower or \
+            upper < value or \
+            np.isnan(value)
         
         cleansedData.append(np.nan if invalid else value)
 
@@ -181,7 +184,7 @@ def METData(lat, lon):
         yMETTemp.append(values['temp'])
         yMETCloud.append(values['cloud'])    
     
-    return xMET, yMETTemp, yMETCloud
+    return pd.Series(xMET), pd.Series(yMETTemp), pd.Series(yMETCloud)
   
 
 
@@ -226,12 +229,50 @@ def getSunAngle(unixTime: int, lat, lon):
 
 
 
+def getInsolation(xList, xCloud, lat, lon):
+    
+    Sc = 1366 # Solar constant is 1366 kW/m^2
+
+    yResult = np.zeros(len(xList))
+    
+    print(xList, xCloud, lon, lat)
+    
+    for i, unixTime in enumerate(xList):
+
+        
+        theta = np.radians(getSunAngle(unixTime, lat, lon))
+
+
+        if theta < 0:
+            yResult[i] = 0
+            continue
+        
+        
+        AM = 1 / np.cos(theta)
+        
+        if xCloud[i] is not np.nan:
+            AM *= xCloud[i]/100 # Apply cloud converage if valid predictions
+        else:
+            AM *= 0
+
+        # Formel for insolasjon
+        insolation = Sc * np.e**(-AM) * np.cos(np.pi/2 - theta)
+        
+        yResult[i] = insolation
+
+    return pd.Series(yResult)
+
+
+
 def combineFromIntervals(data):
     # Combine every 5-min interval into one reading.
     previousTime = data['time'].iloc[0]
 
-    sumTemp = 0
-    numTemp = 0
+    sumTempIn = 0
+    numTempIn = 0
+
+    sumTempOut = 0
+    numTempOut = 0
     
     sumLight = 0
     numLight = 0
@@ -241,20 +282,24 @@ def combineFromIntervals(data):
 
     clearResolutionSeconds = 200
     rowsToDrop = []
-    for id, time, temp, batVolt, light in data.itertuples():
+    for id, time, tempIn, tempOut, batVolt, light in data.itertuples():
 
         cutAVG = True if \
             time - previousTime < clearResolutionSeconds or \
             (numBat > 0 and abs(batVolt - sumBat/numBat) > 0.05) or \
             (numLight > 0 and abs(light - sumLight/numLight) > 10) or \
-            (numTemp > 0 and abs(temp - sumTemp/numTemp) > 0.5) \
+            (numTempIn > 0 and abs(tempIn - sumTempIn/numTempIn) > 0.5) or \
+            (numTempOut > 0 and abs(tempOut - sumTempOut/numTempOut) > 0.5) \
             else False
         
         if cutAVG:
             # print(time, temp, batVolt)
             
-            sumTemp += temp
-            numTemp += 1
+            sumTempIn += tempIn
+            numTempIn += 1
+            
+            sumTempOut += tempOut
+            numTempOut += 1
             
             sumLight += light
             numLight += 1
@@ -266,10 +311,15 @@ def combineFromIntervals(data):
             
         else:
             
-            if numTemp != 0:     
-                avgTemp = round(sumTemp / numTemp, 2)
+            if numTempIn != 0:     
+                avgTempIn = round(sumTempIn / numTempIn, 2)
             else:
-                avgTemp = np.nan
+                avgTempIn = np.nan
+            
+            if numTempOut != 0:
+                avgTempOut = round(sumTempOut / numTempOut, 2)
+            else:
+                avgTempOut = np.nan
                 
                 
             if numBat != 0:
@@ -284,12 +334,15 @@ def combineFromIntervals(data):
                 avgLight = np.nan
                 
                 
-            data.loc[id] = [previousTime, avgTemp, avgBat, avgLight]
+            data.loc[id] = [previousTime, avgTempIn, avgTempOut, avgBat, avgLight]
                 
             previousTime = time
         
-            sumTemp = temp
-            numTemp = 1
+            sumTempIn = tempIn
+            numTempIn = 1
+        
+            sumTempOut = tempOut
+            numTempOut = 1
              
             sumLight += light
             numLight += 1
@@ -301,6 +354,39 @@ def combineFromIntervals(data):
     newData = data.drop(index=rowsToDrop, inplace=False)
     
     return newData
+
+
+
+def interpolate(xTarget: pd.Series, xList: pd.Series, yList: pd.Series):
+    yResult = np.zeros(len(xTarget))
+    
+    currentXIndex = 0
+    
+
+    
+    for i, x in enumerate(xTarget):
+        currentXIndex = max(0, currentXIndex - 1)
+        
+
+       
+        while currentXIndex < len(xList)-1:
+            if xList.iloc[currentXIndex] > x:
+                break
+            
+            currentXIndex += 1
+        
+        
+
+        # Interpolerer mellom "dette punktet" og "neste punkt" i forhold til currentXIndex
+        x0, y0 = xList.iloc[currentXIndex-1], yList.iloc[currentXIndex-1]
+        x1, y1 = xList.iloc[currentXIndex], yList.iloc[currentXIndex]
+        
+        # Formel for interpolering mellom to punkter
+        y = (y0 * (x1 - x) + y1 * (x - x0)) / (x1 - x0)
+        
+        yResult[i] = y
+    
+    return pd.Series(yResult)
 
 
 
@@ -390,27 +476,34 @@ def fetchDrivhusData():
 
 if __name__ == '__main__':
 
-    # Location details
-    lat = 59.017  # Latitude in radians
-    lon = 9.741  # Longitude in degrees
+    # Location details for Langesund
+    # lat = 59.017
+    # lon = 9.741
     
+    # Location details for Skien VGS
+    lat = 59.200
+    lon = 9.612
+    
+    print("Henter data fra Drivhus")
     data = pd.DataFrame(fetchDrivhusData())
     
-    
     data['time'] = cleanTimeData(pd.to_numeric(data['time'].astype(int))) #, unit='s'))
-    data['temp'] = cleanTemperatureData(pd.to_numeric(data['temp'].astype(float)))
+    data['tempIn'] = cleanTemperatureData(pd.to_numeric(data['tempIn'].astype(float)))
+    data['tempOut'] = cleanTemperatureData(pd.to_numeric(data['tempOut'].astype(float)))
     data['batVolt'] = cleanBatteryData(pd.to_numeric(data['batVolt'].astype(float)))
     data['light'] = cleanLightData(pd.to_numeric(data['light']))
 
     data.set_index('id', inplace=True)
 
-    data = combineFromIntervals(data)
-
+    # data = combineFromIntervals(data)
 
     c = 0
     phi = 0
 
-    
+
+
+
+
 
     
     # Plotting
@@ -419,53 +512,112 @@ if __name__ == '__main__':
         # Generate the model
         # xModel, yModel = fitTemperature(data)
     xMET, yMETTemp, yMETCloud = METData(lat, lon)
-    xSun = np.linspace(min(data['time']), max(xMET) + 31536000, 50000) # +31536000 for one year ahead
-    ySun = [getSunAngle(x, lat, lon) for x in xSun]
     
     
-    # Convert from unixTime to DateTime Object
+    
+    xSun = np.linspace(min(data['time']), max(xMET), 50000, dtype=np.int32) # +31536000 for one year ahead
+    
+    ySunAngle = pd.Series([getSunAngle(x, lat, lon) for x in xSun])
+    
+    
+    
+    yMETCloudInterpolated = interpolate(xSun, xMET, yMETCloud)
+    
+    
+    
+    ySunInsolation = getInsolation(xSun, yMETCloudInterpolated, lat, lon)
+    
+    
+    yRealInsolation = interpolate(xSun, data['time'], data['light']) / 120
+    
+    
+
+
+
+    
+    # Convert from unixTime to DateTime Objects
     data['time'] = pd.to_datetime(data['time'].astype(int), unit='s') 
         # xModel = np.array([datetime.fromtimestamp(x) for x in xModel])
     xMET = np.array([datetime.fromtimestamp(x) for x in xMET])
     xSun = np.array([datetime.fromtimestamp(x) for x in xSun])
+    
+
+    
+    
+    
+    
+    
+    # Plotting
+    
     
     
     
     # Temperature
     fig, ax1 = plt.subplots()
 
-    ax1.plot(data['time'], data['temp'], ".", label="Recorded Inside Temperature", color="blue")
+    ax1.plot(data['time'], data['tempIn'], ".", label="Recorded Inside Temperature", color="red")
+    ax1.plot(data['time'], data['tempOut'], ".", label="Recorded Outside Temperature", color="blue")
         # ax1.plot(xModel, yModel, label="Temp. Model", color="red")
-    ax1.plot(xMET, yMETTemp, ".-", label="Forecasted Outside Temperature", color="dodgerblue")
 
+    ax2 = ax1.twinx()
+    
+    ax2.plot(data['time'], data['tempIn']-data['tempOut'], ".-", label = "Temperature Difference")
+    ax2.legend(loc= "upper right")
+    
     ax1.set_ylabel("Temperature")
-    ax1.set_ylim(-15, 15)
+    ax1.set_ylim(-15, 30)
     ax1.legend(loc="upper left")
+    
     
 
     # Customization
     plt.title("Temperature Over Time")
     plt.legend()
     
-    
-    
-    # Cloud Coverage and Sun Angle
     plt.figure(2)
-    plt.plot(xSun, ySun, "-", label="Sun Angle", color="orange")
-    plt.ylim(0, 100)
-    plt.legend(loc="upper right")
+    plt.plot(xMET, yMETTemp, ".-", color="dodgerblue")
+    plt.title("Forecasted Temperature Outside")
     
+    
+    
+    # Figur 1: Solvinkel og skydekning
     plt.figure(3)
-    plt.plot(xMET, yMETCloud, ".-", label="Forecasted Cloud Coverage", color="lightpink")  
+
+    plt.plot(xSun, ySunAngle, "-", label="Sun Angle", color="orange")
+    plt.plot(xMET, yMETCloud, ".-", label="Forecasted Cloud Coverage", color="pink")
+    plt.plot(xSun, yMETCloudInterpolated, ".-", label="Forecasted Cloud Coverage", color="lightpink")
+    plt.ylabel("Sun Angle (°) / Cloud Coverage (%)")
     plt.ylim(0, 100)
+
+    # Legg til legende
     plt.legend(loc="upper right")
+
+    # Legg til tittel og etiketter
+    plt.title("Sun Angle and Cloud Coverage")
+    plt.xlabel("Time")
+
+    # Figur 2: Insolasjon
+    plt.figure(4)
+
+    print(max(ySunInsolation))
     
+    plt.plot(xSun, ySunInsolation, ".-", label="Excpected Insolation", color="yellow")
+    plt.plot(xSun, yRealInsolation, ".-", label="Measured Insolation", color="red")
+    plt.ylabel("Insolation (W/m²)")
+    plt.ylim(0, 1366)
+
+    # Legg til legende
+    plt.legend(loc="upper right")
+
+    # Legg til tittel og etiketter
+    plt.title("Insolation")
+    plt.xlabel("Time")
 
 
     
     # New Plot for Battery
     
-    plt.figure(4)
+    plt.figure(5)
     plt.plot(data['time'], data['batVolt'], ".", label="Battery Voltage", color="navajowhite")
     plt.ylim(1.5, 5)
     plt.legend(loc="upper right")
