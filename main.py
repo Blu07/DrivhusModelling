@@ -1,5 +1,8 @@
 
 
+# TODO: plot MET data in either 2D or 3D. Only for convenience as of right now, ight be useful later.
+
+
 # %% Samle datapunkter for lys, temp-diff og temp endring inne.
 
 # Modell for endring av inne-temp ut ifra lys inn og temp-diff (parametre for 3D-kurve-plan)
