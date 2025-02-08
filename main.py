@@ -29,7 +29,7 @@
 # lagre parameterne for funksjonen i hvert klokkeslett.
 # Gi dette til PROGRAM 2.
 
-
+print("Importerer Biblioteker")
 
 from pprint import pprint
 
@@ -242,11 +242,9 @@ def getSunAngle(unixTime: int, lat, lon, d=None):
     
     return r
 
-def getInsolationAt(unixTime, cloud, lat, lon, d=None):    
+def getInsolationAt(theta, cloud, d=None):    
     Sc = 1366 # Solar constant is 1366 kW/m^2
-        
-    theta = getSunAngle(unixTime, lat, lon, d=d)
-
+  
     if theta < 0:
         return 0
         pass
@@ -397,8 +395,9 @@ def interpolateDrivhusData(dData, dayTimeList):
 
 
 
-
-
+def fitLocalCloudCover():
+    """TODO
+    """
     #--- LYS: Bruk regresjon for å finne tilpassede linjer for hvert klokkelsett
     
     # empiricalToExpectedRatio = empiricalZ / expectedZ
@@ -437,10 +436,7 @@ def interpolateDrivhusData(dData, dayTimeList):
     # Siden solen går opp tidligere om sommeren, vil denne måten finne en fuksjon som passer for data som går gjennom alle tider i året.
     # lagre parameterne for funksjonen i hvert klokkeslett.
 
-    # Gi dette til PROGRAM 2.
-
-
-
+ 
 
 
 
@@ -475,7 +471,9 @@ def modelInsolation(xMET, yMETCloud, dayTimeList):
         
 
 
-    z = []
+    zInsolation = []
+    zCloud = []
+    zSolarAngle = []
 
     for d in range(1, 366):
         for i, t in enumerate(dayTimeList):
@@ -487,14 +485,16 @@ def modelInsolation(xMET, yMETCloud, dayTimeList):
             
             # else:
             cloudPercent = 1 - clearPercent(d)/100
+            theta = getSunAngle(t, lat, lon, d=d)
+            insolation = getInsolationAt(theta, cloudPercent, d)
+            
+            zCloud      .append(cloudPercent * 100)
+            zSolarAngle .append(theta*180/np.pi)
+            zInsolation .append(insolation)
             
             
-            z.append(getInsolationAt(t, cloudPercent, lat, lon, d))
 
-
-    z = np.array(z)
-
-    return z
+    return np.array(zCloud), np.array(zSolarAngle), np.array(zInsolation)
 
 
 
@@ -739,8 +739,6 @@ def plotInterpolatedInsolation(x, y, z):
 
 def plotInsolationModel(x, y, z):
 
-    # Plot Insolation
-    
     fig = plt.figure("Insolation Model")
     ax = fig.add_subplot(111, projection='3d')
 
@@ -756,6 +754,44 @@ def plotInsolationModel(x, y, z):
     ax.set_zlim(0, 1500)
 
     plt.title("Light Levels throughout every day")
+
+
+def plotSolarAngleModel(x, y, z):
+    
+    fig = plt.figure("Solar Angle Model")
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot the data
+    ax.scatter(x, y, z)
+
+
+    # Label the axes
+    ax.set_xlabel(f'Day of Year')
+    ax.set_ylabel('Time of Day [Hour]')
+    ax.set_zlabel('Solar Angle [°]')
+
+    ax.set_zlim(0, 90)
+
+    plt.title("Solar Angle throughout every day")
+
+
+def plotCloudCoverModel(x, y, z):
+    
+    fig = plt.figure("Cloud Cover Model")
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot the data
+    ax.scatter(x, y, z)
+
+
+    # Label the axes
+    ax.set_xlabel(f'Day of Year')
+    ax.set_ylabel('Time of Day [Hour]')
+    ax.set_zlabel('Cloud Cover [%]')
+
+    ax.set_zlim(0, 100)
+
+    plt.title("Cloud Cover Percent throughout every day")
 
 
 def plotTempChangeModel(DF, model):
@@ -782,22 +818,24 @@ def plotTempChangeModel(DF, model):
 
 
     # Label the axes
-    ax.set_xlabel('Insolation [W/m^2]')
-    ax.set_ylabel('Temp. Difference [°C]')
+    ax.set_xlabel('Temp. Difference [°C]')
+    ax.set_ylabel('Insolation [W/m^2]')
     ax.set_zlabel(f'Temp. Change in {timeStep} min. [°C]')
 
-    plt.title("Temperature Change based on Insolation and temperature difference")
+    plt.title("Temperature Change based on Insolation and Temperature Difference")
 
 
-def plotTemperatures(x, y, zOut, zIn):
+def plotTemperatures(x, y, zOut = None, zIn = None):
     # Plot Temperature
     
     fig = plt.figure("Modelled and Simulated Temperatures")
     ax = fig.add_subplot(111, projection='3d')
 
     # Plot the data
-    ax.scatter(x, y, zOut)
-    ax.scatter(x, y, zIn)
+    if zOut is not None:
+        ax.scatter(x, y, zOut)
+    if zIn is not None:
+        ax.scatter(x, y, zIn)
 
     # Label the axes
     ax.set_xlabel(f'Day of Year [Julian Day]')
@@ -816,7 +854,7 @@ if __name__ == "__main__":
     
     lat = 59.200
     lon = 9.612
-    timeStep = 15 # minutes
+    timeStep = 60 # minutes
     
     # Lag en xListe med unix-tiden for antall sekunder siden 00:00:00
     numPerDay = 24*60//timeStep
@@ -839,23 +877,27 @@ if __name__ == "__main__":
     # Create models of data
     tempChangeDF, tempChangeModel = fitTempChange(dData, resolution=10000, radius=10)
     zAirTemps = modelDayTemps(dayTimeList)
-    zLight = modelInsolation(xMET, yMETCloud, dayTimeList)
+    zCloud, zSolarAngle, zInsolation = modelInsolation(xMET, yMETCloud, dayTimeList)
     
     # Simulate indoor temperature
-    zDrivhusTemps = simulateTemperature(dayTimeList, zAirTemps, zLight, tempChangeModel)
+    zDrivhusTemps = simulateTemperature(dayTimeList, zAirTemps, zInsolation, tempChangeModel)
     
     xRawInterp, yRawInterp, zRawInterpTempIn, zRawInterpTempOut, zRawInterpInsolation = interpolateDrivhusData(dData, dayTimeList)
     
+    
+    
     # Plot all the models and simulation temperature
+    print("Plotter grafer")
     plotBatteryVoltage(xTimeRawDrivhus, dData['batVolt'])
     plotRawTemperatures(xTimeRawDrivhus, dData['tempOut'], dData['tempIn'])
-    # plotRawInsolation(xTimeRawDrivhus, dData['light']/120)
-    
     plotInterpolatedTemperatures(xRawInterp, yRawInterp, zRawInterpTempOut, zRawInterpTempIn)
     plotInterpolatedInsolation(xRawInterp, yRawInterp, zRawInterpInsolation)
     
+    plotSolarAngleModel(xFullYear, yFullYear, zSolarAngle)
+    plotCloudCoverModel(xFullYear, yFullYear, zCloud)
+    plotInsolationModel(xFullYear, yFullYear, zInsolation)
     
-    plotInsolationModel(xFullYear, yFullYear, zLight)
     plotTempChangeModel(tempChangeDF, tempChangeModel)
+    
     plotTemperatures(xFullYear, yFullYear, zAirTemps, zDrivhusTemps)
     plt.show()
