@@ -369,9 +369,9 @@ def interpolateDrivhusData(dData, dayTimeList):
     for key in daysDict.keys():
 
 
-        interpTempIn = np.interp(dayTimeList, timesDaysList[key], [x[0] for x in daysDict[key]])
-        interpTempOut = np.interp(dayTimeList, timesDaysList[key], [x[1] for x in daysDict[key]])
-        interpInsolation = np.interp(dayTimeList, timesDaysList[key], [x[2] for x in daysDict[key]])
+        interpTempIn = np.interp(dayTimeList, timesDaysList[key], [x[0] for x in daysDict[key]], np.nan, np.nan)
+        interpTempOut = np.interp(dayTimeList, timesDaysList[key], [x[1] for x in daysDict[key]], np.nan, np.nan)
+        interpInsolation = np.interp(dayTimeList, timesDaysList[key], [x[2] for x in daysDict[key]], np.nan, np.nan)
         
         
         insolationList.append(interpInsolation)
@@ -670,17 +670,27 @@ def simulateTemperature(dayTimeList, zTemps, zLight, tempChangeModel):
 # %% Plotting
 
 
-def plotRawTemperatures(x, yOut, yIn):
+def plotRawData(x, yTempOut, yTempIn, yInsolation):
     
-    plt.figure("Raw Temperatures")
-    plt.plot(x, yOut, ".", label="Outside Temperature", color="blue")
-    plt.plot(x, yIn, ".", label="Inside Temperature", color="red")
+    fig, ax1 = plt.subplots()
+    fig.canvas.manager.set_window_title("Raw Data")  # Setter vindustittel
+    
+    ax1.plot(x, yTempOut, ".", label="Outside Temperature", color="blue")
+    ax1.plot(x, yTempIn, ".", label="Inside Temperature", color="red")
 
-    plt.title("Temperature Over Time")
-    plt.ylabel("Temperature [°C]")
+    ax1.set_title("Temperature and Insolation Over Time")
+    ax1.set_xlabel("Time")
+    ax1.set_ylabel("Temperature [°C]", color="black")
+    ax1.set_ylim(-15, 30)
 
-    plt.ylim(-15, 30)
-    plt.legend(loc="upper left")
+    ax2 = ax1.twinx()
+    ax2.plot(x, yInsolation, ".", label="Insolation", color="orange")
+    
+    ax2.set_ylabel("Insolation [W/m^2]", color="black")
+    ax2.set_ylim(0, min(1400, max(yInsolation) * 1.2))
+
+    fig.legend(loc="upper left")
+
 
 
 def plotRawInsolation(x, y):
@@ -734,7 +744,7 @@ def plotInterpolatedInsolation(x, y, z):
     ax.set_ylabel('Time of Day [Hour]')
     ax.set_zlabel('Light [W/m^2]')
 
-    ax.set_zlim(0, min(1400, max(z)))
+    ax.set_zlim(0, min(1400, np.nanmax(z)))
 
 
 def plotInsolationModel(x, y, z):
@@ -854,7 +864,7 @@ if __name__ == "__main__":
     
     lat = 59.200
     lon = 9.612
-    timeStep = 60 # minutes
+    timeStep = 15 # minutes
     
     # Lag en xListe med unix-tiden for antall sekunder siden 00:00:00
     numPerDay = 24*60//timeStep
@@ -889,7 +899,7 @@ if __name__ == "__main__":
     # Plot all the models and simulation temperature
     print("Plotter grafer")
     plotBatteryVoltage(xTimeRawDrivhus, dData['batVolt'])
-    plotRawTemperatures(xTimeRawDrivhus, dData['tempOut'], dData['tempIn'])
+    plotRawData(xTimeRawDrivhus, dData['tempOut'], dData['tempIn'], dData['light']/120)
     plotInterpolatedTemperatures(xRawInterp, yRawInterp, zRawInterpTempOut, zRawInterpTempIn)
     plotInterpolatedInsolation(xRawInterp, yRawInterp, zRawInterpInsolation)
     
