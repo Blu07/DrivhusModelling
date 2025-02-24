@@ -1,17 +1,7 @@
 
 
-# TODO: plot MET data in either 2D or 3D. Only for convenience as of right now, ight be useful later.
 
-
-# %% Samle datapunkter for lys, temp-diff og temp endring inne.
-
-# Modell for endring av inne-temp ut ifra lys inn og temp-diff (parametre for 3D-kurve-plan)
-# - 
-# Modell for lokale lysforhold (parametre for lys inn for hvert tidspunkt)
-
-
-
-# %% Modell for lys-inn i lokale fohold
+# %% Modell for lys-inn i lokale fohold - NOTATER, IDEER
 # Lag en liste med lister. Hver liste er én dag.
 # Hver dag inneholder en liste med lysforoldene for hver spesifikke tid. f.eks. hver time.
 # Lag en xListe med unix-tiden for antall sekunder siden 00:00:00
@@ -29,6 +19,9 @@
 # lagre parameterne for funksjonen i hvert klokkeslett.
 # Gi dette til PROGRAM 2.
 
+
+
+# %% Import libraries
 print("Importerer Biblioteker")
 
 from datetime import datetime as dt
@@ -39,142 +32,13 @@ from scipy.optimize import curve_fit
 
 import statsmodels.api as sm
 
-from plotting import *
-from getData import * 
+from utils.plotting import *
+from utils.getData import * 
+from utils.sunCalculations import *
 
 
 
 
-
-def clearPercent(day: int):
-    
-    A = 10.097
-    d = 44.163
-    
-    clearPercent = A * np.sin(0.021*day - 2.311) + d
-
-    return clearPercent
-
-
-def getSunAngle(unixTime: int, lat, lon, d=None):
-    dateTime = dt.fromtimestamp(unixTime)
-    
-    # Local time in minutes
-    LT = dateTime.hour * 60 + dateTime.minute
-
-    # Local Standard Time Meridian (LSTM)
-    LSTM = 15 * 1  # 15 degrees per hour for UTC+1
-
-    # Day of the year
-    if d is None:
-        d = dateTime.timetuple().tm_yday
-    #print(f"Day of year: {d}")
-
-    # Solar declination angle (δ)
-    B = np.radians((360 / 365) * (d - 81))
-    #print(f"B (in radians): {B}")
-    decl = np.radians(23.44) * np.sin(B)
-
-    # Equation of Time (EOT)
-    EOT = 9.87 * np.sin(2 * B) - 7.53 * np.cos(B) - 1.5 * np.sin(B)
-    #print(f"EOT (in minutes): {EOT}")
-
-    # Time Correction Factor (TC)
-    TC = 4 * (lon - LSTM) + EOT
-
-    # Local Solar Time (LST)
-    LST = LT + TC
-    HRA = 15 * ((LST / 60) - 12)  # Hour Angle in degrees
-
-    # Solar Elevation Angle
-    r = np.arcsin(np.sin(np.radians(lat)) * np.sin(decl) +
-                  np.cos(np.radians(lat)) * np.cos(decl) * np.cos(np.radians(HRA)))
-
-    
-    return r
-
-def getInsolationAt(theta, cloud, d=None):    
-    Sc = 1366 # Solar constant is 1366 kW/m^2
-  
-    if theta < 0:
-        return 0
-        pass
-    
-    
-    AM = 0
-    if d is not None:
-        AM = cloud/np.cos(theta)
- 
-    # Formel for insolasjon
-    insolation = Sc * np.e**(-AM) * np.cos(np.pi/2 - theta)
-    
-    return insolation
-
-
-def getFirstSunRiseTime(day, timeList):
-    for t in timeList:
-        sunAngle = getSunAngle(t, lat, lon, day)
-
-        if sunAngle > 0:
-            return t
-
-
-
-#%% FETCH DRIVHUS DATA AND CLEAN FAULTY READINGS
-def drivhusData():
-
-    print("Henter data fra Drivhus")
-    dData = pd.DataFrame(fetchDrivhusData(firstID=19989))
-    timeCalibration = 3600
-
-
-    dData['time'] = cleanData(
-        pd.to_numeric(dData['time'].astype(int)),
-        lower=1700000000,
-        upper=1900000000,
-        errors=[],
-        calibration=timeCalibration # Adjust for GMT+1
-    )
-
-    dData['tempIn'] = cleanData(
-        pd.to_numeric(dData['tempIn'].astype(float)),
-        lower=-25,
-        upper=40,
-        errors=[],
-        calibration=0
-    )
-
-    dData['tempOut'] = cleanData(
-        pd.to_numeric(dData['tempOut'].astype(float)),
-        lower=-25,
-        upper=40,
-        errors=[-127, 85],
-        calibration=0
-    )
-
-    dData['batVolt'] = cleanData(
-        pd.to_numeric(dData['batVolt'].astype(float)),
-        lower=2.0,
-        upper=4.5,
-        errors=[],
-        calibration=0
-    )
-
-    dData['light'] = cleanData(
-        pd.to_numeric(dData['light'].astype(int)),
-        lower=0,
-        upper=100_000,
-        errors=[],
-        calibration=0
-    )
-
-
-    dData.set_index('id', inplace=True)
-    
-    # data = combineFromIntervals(data) # To be worked on, using all data for now
-    
-    
-    return dData
 
 
 
@@ -182,12 +46,18 @@ def drivhusData():
 
 # %% INTERPOLER RÅ DATA TIL DAGLIGE VERDIER
 
-def interpolateDrivhusData(dData, dayTimeList):
+def interpolateDrivhusData(dData, timeStep):
 
     # Lag en liste med lister. Hver liste er én dag.
     # Hver dag inneholder en liste med lysforoldene for hver spesifikke tid. f.eks. hver time.
 
     print("Lager modell for lokale lysforhold.")
+    
+    
+    # list of the unix-time for seconds 00:00:00 - 23:59:59 at the given resolution
+    numPerDay = 24*60//timeStep
+    dayTimeList = np.linspace(0, 86400, num=numPerDay, endpoint=False)
+    
 
     daysDict = dict()
     timesDaysList = dict()
@@ -244,6 +114,8 @@ def interpolateDrivhusData(dData, dayTimeList):
     return x, y, zTempIn, zTempOut, zInsolation
 
 
+
+
 #%% MODELL FOR LOKALE LYSFORHOLD
 
 def fitLocalCloudCover():
@@ -288,7 +160,6 @@ def fitLocalCloudCover():
     # lagre parameterne for funksjonen i hvert klokkeslett.
 
  
-
 
 
 # %% MODELL for forventet lysmengde uavhengig av målte data
@@ -352,7 +223,7 @@ def modelInsolation(xMET, yMETCloud, dayTimeList):
 
 # %% Modell for gjennomsnittstemperatur gjennom året
 
-def modelDayTemps(dayTimeList):
+def modelDayTemps(dayTimeList, highs, lows, lat, lon):
 
     def dayTempModel(x, high, low, highTime, lowTime):
                 
@@ -375,10 +246,6 @@ def modelDayTemps(dayTimeList):
         return A * sine + d
         
 
-    # Månedlige høy- og lavtemperaturer for Skien
-    highs = [-1.8, -0.9, 3.5, 9.1, 15.5, 20.4, 21.5, 20.1, 15.1, 9.3, 3.2, -0.5]
-    lows =  [-6.8, -6.8, -3.3, 0.8, 5.5, 10.5, 12.2, 11.3, 7.5, 3.8, -1.5, -5.6]
-
     monthList = np.linspace(1, 12, 12, endpoint=True)/12 * 365
     yearList = np.linspace(1, 365, 365, endpoint=True)
 
@@ -392,7 +259,7 @@ def modelDayTemps(dayTimeList):
 
     for d in range(0, 365):
                 
-        sunRiseTime = getFirstSunRiseTime(day=d, timeList=dayTimeList)
+        sunRiseTime = getFirstSunRiseTime(day=d, timeList=dayTimeList, lat=lat, lon=lon)
         sunRiseTime = sunRiseTime / 3600 + 0.5 # Convert from seconds to hours and add half an hour.
         
         
@@ -416,6 +283,7 @@ def modelDayTemps(dayTimeList):
     z = np.array(z)
 
     return z
+
 
 
 
@@ -477,9 +345,8 @@ def fitTempChange(dData, resolution=100, radius=5):
 
 
 
-
 # %% SIMULERING
-def simulateTemperature(dayTimeList, zTemps, zLight, tempChangeModel):
+def simulateTemperature(dayTimeList, zTemps, zLight, tempChangeModel, lat, lon):
     
     numPerDay = len(dayTimeList)
     
@@ -491,7 +358,7 @@ def simulateTemperature(dayTimeList, zTemps, zLight, tempChangeModel):
         
         currentTemp = 0
          
-        sunRiseTimeSec = getFirstSunRiseTime(day=d, timeList=dayTimeList)
+        sunRiseTimeSec = getFirstSunRiseTime(day=d, timeList=dayTimeList, lat=lat, lon=lon)
 
         
         for i, timeSec in enumerate(dayTimeList):
@@ -499,7 +366,7 @@ def simulateTemperature(dayTimeList, zTemps, zLight, tempChangeModel):
             outsideTemp = zTemps[numPerDay*d + i]
             insolation = zLight[numPerDay*d + i]
             
-            # Let the inside tmep follow the outside temp down until sunrise.
+            # Let the inside temp follow the outside temp down until sunrise.
             # The temperatures should be approximately the same after a night with no light
             if timeSec < sunRiseTimeSec:                
                 currentTemp = outsideTemp
@@ -521,11 +388,15 @@ def simulateTemperature(dayTimeList, zTemps, zLight, tempChangeModel):
 # %%
 if __name__ == "__main__":
     
+    # Location of Drivhus at Skien VGS
     lat = 59.200
     lon = 9.612
-    timeStep = 15 # minutes
     
-    # Lag en xListe med unix-tiden for antall sekunder siden 00:00:00
+    # Time step
+    timeStep = 60 # minutes
+    rawInterpTimeStep = 5 # minutes
+    
+    # list of the unix-time for seconds 00:00:00 - 23:59:59 at the given resolution
     numPerDay = 24*60//timeStep
     dayTimeList = np.linspace(0, 86400, num=numPerDay, endpoint=False)
 
@@ -534,27 +405,35 @@ if __name__ == "__main__":
     yFullYear = np.array([dayTimeList]*365).flatten()/3600
 
 
+
+    # Månedlige høy- og lavtemperaturer for Skien
+    # TODO: hente inn bedre data og legge til rette for dette tilsvarende funksjon
+    highs = [-1.8, -0.9, 3.5, 9.1, 15.5, 20.4, 21.5, 20.1, 15.1, 9.3, 3.2, -0.5]
+    lows =  [-6.8, -6.8, -3.3, 0.8, 5.5, 10.5, 12.2, 11.3, 7.5, 3.8, -1.5, -5.6]
+    
+
+
     # Fetch data from Drivhus and MET
     dData = drivhusData()
     xMET, _, yMETCloud = METData("sigMet.json", lat, lon)
     
     
+    xRawInterp, yRawInterp, zRawInterpTempIn, zRawInterpTempOut, zRawInterpInsolation = interpolateDrivhusData(dData, rawInterpTimeStep)
     
-    # Time as dateTime-objects for raw data
-    xTimeRawDrivhus = pd.to_datetime(dData['time'].astype(int), unit='s') 
     
     # Create models of data
     tempChangeDF, tempChangeModel = fitTempChange(dData, resolution=10000, radius=10)
-    zAirTemps = modelDayTemps(dayTimeList)
+    zAirTemps = modelDayTemps(dayTimeList, highs, lows, lat, lon)
     zCloud, zSolarAngle, zInsolation = modelInsolation(xMET, yMETCloud, dayTimeList)
     
     # Simulate indoor temperature
-    zDrivhusTemps = simulateTemperature(dayTimeList, zAirTemps, zInsolation, tempChangeModel)
+    zDrivhusTemps = simulateTemperature(dayTimeList, zAirTemps, zInsolation, tempChangeModel, lat, lon)
     
-    xRawInterp, yRawInterp, zRawInterpTempIn, zRawInterpTempOut, zRawInterpInsolation = interpolateDrivhusData(dData, dayTimeList)
+
+    # Time as dateTime-objects for plotting raw data
+    xTimeRawDrivhus = pd.to_datetime(dData['time'].astype(int), unit='s') 
 
 
-    
     # Plot all the models and simulation temperature
     print("Plotter grafer")
     plotBatteryVoltage(xTimeRawDrivhus, dData['batVolt'])
