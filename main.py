@@ -31,165 +31,16 @@
 
 print("Importerer Biblioteker")
 
-from pprint import pprint
-
-from datetime import datetime as dt, timedelta
+from datetime import datetime as dt
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
-import json
-import requests
 
 import statsmodels.api as sm
 
-
-
-
-
-def fetchDrivhusData(firstID=0):
-    
-    
-    drivhusURL = 'https://drivhus.bluwo.me/get_data.php'
-    data = {
-        "fromID": firstID
-    }
-    
-    response = requests.post(drivhusURL, json=data)
-    statusCode = response.status_code
-    
-    match statusCode:
-        case 200:
-            data = response.json()
-            
-            if len(data) == 0:
-                print("No data from Drivhus.")
-                return []
-            
-            
-            print(f"Received {len(data)} rows from Drivhus.")
-            
-            return data
-        
-        case _:
-            print(f"Got status code {statusCode} and body {response.text} from Drivhus")
-        
-def cleanData(data, lower, upper, errors=[], calibration=0):
- 
-    cleansedData = []
-    for value in data:
-        invalid = \
-            (value in errors) or \
-            value < lower or \
-            value > upper or \
-            np.isnan(value)
-        
-        cleansedData.append(np.nan if invalid else value + calibration)
-
-    return cleansedData
-
-
-
-
-def openStoredData(filename) -> dict:
-    with open(filename, 'r') as read_file:
-        storedData: dict = json.load(read_file)
-        return storedData
-    
-def saveUpdatedData(filename, data) -> None:
-    with open(filename, 'w') as write_file:
-        json.dump(data, write_file, indent=4)
-
-def hasMETExpired(data: dict) -> bool:
-    expiresDateTime = dt.strptime(data.get("Expires"), "%a, %d %b %Y %H:%M:%S %Z") + timedelta(hours=1) # GMT+1
-    
-    if dt.now() < expiresDateTime:
-        return False
-    
-    return True
-
-
-def fetchMETData(fileName, lat, lon):
-    storedData: dict = openStoredData(fileName)
-
-    if not hasMETExpired(storedData):
-        print("Weather data has NOT expired. Using stored data.")
-        return storedData
-
-    
-    
-    print("Weather data HAS expired. Fetching new data.")
-    
-    lastModifiedTime = storedData.get("last-modified")
-    MET_URL = f'https://api.met.no/weatherapi/locationforecast/2.0/compact?lat={lat}&lon={lon}&altitude=4' # Langesund Coordinates
-    headers = {
-        'User-Agent': 'Blus Drivhus 1.0',
-        'From': 'bluwo.me',
-        'If-Modified-Since': lastModifiedTime
-    }
-    
-    response = requests.get(MET_URL, headers=headers)
-    statusCode = response.status_code
-    
-    # Handle and early return failed requests
-    if statusCode != 200:
-        if statusCode == 304:
-            print("Weather data has not been updated since last fetch. Using previously downloaded data.")
-            return storedData
-        else:
-            print(f"Got status code {statusCode} and body '{response.text}'")
-            return None
-        
-
-    MET_data = response.json()
-    
-    # Update the Expires and last-modified fields
-    storedData['Expires'] = response.headers.get("Expires")
-    storedData['last-modified'] = response.headers.get("last-modified")
-    
-    
-    # This removes the values that is replaced by the incoming values 
-    existingTimes = list(map(lambda x: int(x), storedData['rows'].keys()))
-    firstTime = int(dt.fromisoformat(MET_data['properties']['timeseries'][0]['time']).timestamp())
-
-    for time in existingTimes:
-        if time >= firstTime:
-            storedData['rows'].pop(str(time))
-    
-    
-    
-    # Insert the new values
-    for hour in MET_data['properties']['timeseries']:
-        time = int(dt.fromisoformat(hour['time']).timestamp())
-        MET_row = hour['data']['instant']['details']
-        
-        row = {
-            'temp': MET_row['air_temperature'],
-            'cloud': MET_row['cloud_area_fraction']
-        }
-        
-        storedData['rows'].update({str(time): row})
-    
-    
-    saveUpdatedData(fileName, storedData)
-
-    return storedData
-
-def METData(fileName, lat, lon):
-    data: dict = fetchMETData(fileName, lat, lon)['rows']
-    
-    xMET = []
-    yMETTemp = []
-    yMETCloud = []
-    
-    for time, values in data.items():
-        xMET.append(int(dt.fromtimestamp(int(time)).timestamp()))
-        
-        yMETTemp.append(values['temp'])
-        yMETCloud.append(values['cloud'])    
-    
-    return pd.Series(xMET), pd.Series(yMETTemp), pd.Series(yMETCloud)
-  
+from plotting import *
+from getData import * 
 
 
 
@@ -329,8 +180,7 @@ def drivhusData():
 
 
 
-
-#%% MODELL FOR LOKALE LYSFORHOLD
+# %% INTERPOLER RÅ DATA TIL DAGLIGE VERDIER
 
 def interpolateDrivhusData(dData, dayTimeList):
 
@@ -394,6 +244,7 @@ def interpolateDrivhusData(dData, dayTimeList):
     return x, y, zTempIn, zTempOut, zInsolation
 
 
+#%% MODELL FOR LOKALE LYSFORHOLD
 
 def fitLocalCloudCover():
     """TODO
@@ -667,199 +518,7 @@ def simulateTemperature(dayTimeList, zTemps, zLight, tempChangeModel):
 
 
 
-# %% Plotting
-
-
-def plotRawData(x, yTempOut, yTempIn, yInsolation):
-    
-    fig, ax1 = plt.subplots()
-    fig.canvas.manager.set_window_title("Raw Data")  # Setter vindustittel
-    
-    ax1.plot(x, yTempOut, ".", label="Outside Temperature", color="blue")
-    ax1.plot(x, yTempIn, ".", label="Inside Temperature", color="red")
-
-    ax1.set_title("Temperature and Insolation Over Time")
-    ax1.set_xlabel("Time")
-    ax1.set_ylabel("Temperature [°C]", color="black")
-    ax1.set_ylim(-15, 30)
-
-    ax2 = ax1.twinx()
-    ax2.plot(x, yInsolation, ".", label="Insolation", color="orange")
-    
-    ax2.set_ylabel("Insolation [W/m^2]", color="black")
-    ax2.set_ylim(0, min(1400, max(yInsolation) * 1.2))
-
-    fig.legend(loc="upper left")
-
-
-
-def plotRawInsolation(x, y):
-    
-    plt.figure("Raw Insolation")
-    plt.plot(x, y, ".", label="Recorded Insolation", color="orange")
-
-    plt.title("Insolation over time")
-    plt.ylabel("Inoslation [W/m^2]")
-
-    plt.ylim(0, min(1400, max(y)))
-    plt.legend(loc="upper left")
- 
-    
-def plotBatteryVoltage(x, y):
-    
-    plt.figure("Battery Voltage")
-    plt.plot(x, y, ".", label="Battery Voltage", color="navajowhite")
-    
-    plt.title("Battery Voltage over time")
-    plt.ylabel("Voltage [V]")
-    plt.ylim(2.5, 4.5)
-    plt.legend(loc="upper right")
-
-
-def plotInterpolatedTemperatures(x, y, zOut, zIn):
-    
-    fig = plt.figure("Interpolated Temperatures")
-    ax = fig.add_subplot(111, projection='3d')
-
-    ax.scatter(x, y, zOut, color="blue")
-    ax.scatter(x, y, zIn, color="red")
-
-
-    plt.title("Temperatures throughout every day")
-    ax.set_xlabel(f'Day of Year [Julian Day]')
-    ax.set_ylabel('Time of Day [Hour]')
-    ax.set_zlabel('Temperature [°C]')
-
-
-def plotInterpolatedInsolation(x, y, z):
-    
-    fig = plt.figure("Interpolated Insolation")
-    ax = fig.add_subplot(111, projection='3d')
-
-    ax.scatter(x, y, z, color="orange")
-
-
-    plt.title("Light levels throughout every day")
-    ax.set_xlabel(f'Day of Year [Julian Day]')
-    ax.set_ylabel('Time of Day [Hour]')
-    ax.set_zlabel('Light [W/m^2]')
-
-    ax.set_zlim(0, min(1400, np.nanmax(z)))
-
-
-def plotInsolationModel(x, y, z):
-
-    fig = plt.figure("Insolation Model")
-    ax = fig.add_subplot(111, projection='3d')
-
-    # Plot the data
-    ax.scatter(x, y, z)
-
-
-    # Label the axes
-    ax.set_xlabel(f'Day of Year')
-    ax.set_ylabel('Time of Day [Hour]')
-    ax.set_zlabel('Light [W/m^2]')
-
-    ax.set_zlim(0, 1500)
-
-    plt.title("Light Levels throughout every day")
-
-
-def plotSolarAngleModel(x, y, z):
-    
-    fig = plt.figure("Solar Angle Model")
-    ax = fig.add_subplot(111, projection='3d')
-
-    # Plot the data
-    ax.scatter(x, y, z)
-
-
-    # Label the axes
-    ax.set_xlabel(f'Day of Year')
-    ax.set_ylabel('Time of Day [Hour]')
-    ax.set_zlabel('Solar Angle [°]')
-
-    ax.set_zlim(0, 90)
-
-    plt.title("Solar Angle throughout every day")
-
-
-def plotCloudCoverModel(x, y, z):
-    
-    fig = plt.figure("Cloud Cover Model")
-    ax = fig.add_subplot(111, projection='3d')
-
-    # Plot the data
-    ax.scatter(x, y, z)
-
-
-    # Label the axes
-    ax.set_xlabel(f'Day of Year')
-    ax.set_ylabel('Time of Day [Hour]')
-    ax.set_zlabel('Cloud Cover [%]')
-
-    ax.set_zlim(0, 100)
-
-    plt.title("Cloud Cover Percent throughout every day")
-
-
-def plotTempChangeModel(DF, model):
-    # Plot Temp Change Model
-    
-    fig = plt.figure("Temperature Change Model")
-    ax = fig.add_subplot(111, projection='3d')
-
-    # Plot the data
-    ax.scatter(DF['temp_diff'], DF['light_in'], DF['temp_change'])
-
-
-    # Lag en meshgrid for å tegne flaten
-    x_surf = np.linspace(DF['temp_diff'].min(), DF['temp_diff'].max(), 20)
-    y_surf = np.linspace(DF['light_in'].min(), DF['light_in'].max(), 20)
-    x_surf, y_surf = np.meshgrid(x_surf, y_surf)
-
-    # Beregn predikerte verdier basert på modellen
-    exog = pd.DataFrame({'const': 1, 'temp_diff': x_surf.ravel(), 'light_in': y_surf.ravel()})
-    z_surf = model.predict(exog).values.reshape(x_surf.shape)
-
-    # Plott flaten
-    ax.plot_surface(x_surf, y_surf, z_surf, color='None', alpha=0.5)
-
-
-    # Label the axes
-    ax.set_xlabel('Temp. Difference [°C]')
-    ax.set_ylabel('Insolation [W/m^2]')
-    ax.set_zlabel(f'Temp. Change in {timeStep} min. [°C]')
-
-    plt.title("Temperature Change based on Insolation and Temperature Difference")
-
-
-def plotTemperatures(x, y, zOut = None, zIn = None):
-    # Plot Temperature
-    
-    fig = plt.figure("Modelled and Simulated Temperatures")
-    ax = fig.add_subplot(111, projection='3d')
-
-    # Plot the data
-    if zOut is not None:
-        ax.scatter(x, y, zOut)
-    if zIn is not None:
-        ax.scatter(x, y, zIn)
-
-    # Label the axes
-    ax.set_xlabel(f'Day of Year [Julian Day]')
-    ax.set_ylabel('Time of Day [Hour]')
-    ax.set_zlabel('Air Temperature [°C]')
-
-    ax.set_zlim(-15, 60)
-
-    plt.title("Temperature throughout every day")
-
-
-
-
-# %% 
+# %%
 if __name__ == "__main__":
     
     lat = 59.200
@@ -893,8 +552,8 @@ if __name__ == "__main__":
     zDrivhusTemps = simulateTemperature(dayTimeList, zAirTemps, zInsolation, tempChangeModel)
     
     xRawInterp, yRawInterp, zRawInterpTempIn, zRawInterpTempOut, zRawInterpInsolation = interpolateDrivhusData(dData, dayTimeList)
-    
-    
+
+
     
     # Plot all the models and simulation temperature
     print("Plotter grafer")
@@ -907,7 +566,7 @@ if __name__ == "__main__":
     plotCloudCoverModel(xFullYear, yFullYear, zCloud)
     plotInsolationModel(xFullYear, yFullYear, zInsolation)
     
-    plotTempChangeModel(tempChangeDF, tempChangeModel)
+    plotTempChangeModel(tempChangeDF, tempChangeModel, timeStep)
     
     plotTemperatures(xFullYear, yFullYear, zAirTemps, zDrivhusTemps)
     plt.show()
