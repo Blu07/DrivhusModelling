@@ -1,157 +1,302 @@
-
-
-
-# %% Modell for lys-inn i lokale fohold - NOTATER, IDEER
-# Lag en liste med lister. Hver liste er én dag.
-# Hver dag inneholder en liste med lysforoldene for hver spesifikke tid. f.eks. hver time.
-# Lag en xListe med unix-tiden for antall sekunder siden 00:00:00
-# Finn unix-tiden for 00:00:00 fosr DEN DAGEN
-# Trekk denne verdien fra alle elementene i lista.
-# Interpoler lista med lys til å passe med xListen med unix-tider etter kl. 00:00:00.
-# Legg den interpolerte lista til i lista for alle dager
-
-# For å visualisere:
-# Plot alle punktene.
-
-# Lag en funksjon for en linje som passer gjennom lysforholdet for alle dagene på de spesifikke tidene.
-# F.eks. en funksjon som passer for lysforholdet kl. 08:00.
-# Siden solen går opp tidligere om sommeren, vil denne måten finne en fuksjon som passer for data som går gjennom alle tider i året.
-# lagre parameterne for funksjonen i hvert klokkeslett.
-# Gi dette til PROGRAM 2.
-
-
-
 # %% Import libraries
 print("Importerer Biblioteker")
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime as dt
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
 
-from pprint import pprint
-
-import statsmodels.api as sm
-
-from utils.plotting import *
-from utils.getData import * 
-from utils.sunCalculations import *
+# from utils.getData import * 
 
 
 
+# Measured values from Drivhus
+A_AIR = 42 # m^2
+A_EKSP = 15 # m^2
+A_FLOOR = 15 # m^2
 
-def structureByDay(dData: pd.DataFrame):
+ALBEDO = 0.4
+TRANSMISSION = 0.8
+
+
+LUX_CONVERSION = 1/7.5 # W/m^2 per Lx
+
+
+
+#%% SUN CALCULATIONS
+
+
+def getSunAngleDeg(unixTime: int, lat, lon, d=None):
+    dateTime = dt.fromtimestamp(unixTime)
     
-    daysDict = {}
-    
-    # Lagre alle verdiene i tidslista ut ifra hvilken dag på året de er i.
-    for i, unixTime in dData['time'].items():
+    # Local time in minutes
+    LT = dateTime.hour * 60 + dateTime.minute
 
-        time = dt.fromtimestamp(unixTime)
-        tempIn = dData['tempIn'].iloc[i]
-        tempOut = dData['tempOut'].iloc[i]
-        insolation = dData['light'].iloc[i]
-        
-        
-        twleveOCLock = dt(time.year, time.month, time.day, 0, 0, 0).timestamp()
-        timeOfDay = unixTime - twleveOCLock
-        
-        dayNum = time.timetuple().tm_yday
+    # Local Standard Time Meridian (LSTM)
+    LSTM = 15 * 1  # 15 degrees per hour for UTC+1
 
-        daysDict.setdefault(dayNum, {}).setdefault("time", []).append(timeOfDay)
-        daysDict.setdefault(dayNum, {}).setdefault("tempIn", []).append(tempIn)
-        daysDict.setdefault(dayNum, {}).setdefault("tempOut", []).append(tempOut)
-        daysDict.setdefault(dayNum, {}).setdefault("light", []).append(insolation)
+    # Day of the year
+    if d is None:
+        d = dateTime.timetuple().tm_yday
+    #print(f"Day of year: {d}")
 
-    return daysDict
+    # Solar declination angle (δ)
+    B = np.radians((360 / 365) * (d - 81))
+    #print(f"B (in radians): {B}")
+    decl = np.radians(23.44) * np.sin(B)
 
-def calculateH(dData: pd.DataFrame):
+    # Equation of Time (EOT)
+    EOT = 9.87 * np.sin(2 * B) - 7.53 * np.cos(B) - 1.5 * np.sin(B)
+    #print(f"EOT (in minutes): {EOT}")
+
+    # Time Correction Factor (TC)
+    TC = 4 * (lon - LSTM) + EOT
+
+    # Local Solar Time (LST)
+    LST = LT + TC
+    HRA = 15 * ((LST / 60) - 12)  # Hour Angle in degrees
+
+    # Solar Elevation Angle
+    r = np.arcsin(np.sin(np.radians(lat)) * np.sin(decl) +
+                  np.cos(np.radians(lat)) * np.cos(decl) * np.cos(np.radians(HRA)))
     
-    tempDiff = dData['tempIn'] - dData['tempOut']
-    
-    
-    # Calculate h for intervals of 1h through each day and plot
+    return r
+
+getInsolation = lambda sunAngle: 0 if sunAngle < 0 else 1361 * np.sin(sunAngle)  # W/m^2 https://no.wikipedia.org/wiki/Solkonstanten
+
+
+def getFirstSunRiseTime(day, timeList, lat, lon):
+    for t in timeList:
+        sunAngle = getSunAngleDeg(t, lat, lon, day)
+
+        if sunAngle > 0:
+            return t
+
+
+
+#%% CLEANING DATA
+
+
+def cleanData(data, lower, upper, errors=[], calibration=0, factor=1, lowerDerivative=None, upperDerivative=None):
+    cleansedData = []
+    for i, value in enumerate(data):
+        invalid = \
+            (value in errors) or \
+            value < lower or \
+            value > upper or \
+            np.isnan(value)
             
+        # Add derivative thresholds
+        if lowerDerivative is not None and i < len(data) - 2:
+            if abs(np.nan_to_num(data[i+1] - value)) < lowerDerivative:
+                invalid = True
+                
+        if upperDerivative is not None and i < len(data) - 2:
+            if abs(np.nan_to_num(data[i+1] - value)) > upperDerivative:
+                invalid = True
+        
+        cleansedData.append(np.nan if invalid else (value + calibration) * factor)
+
+    return cleansedData
+
+
+
+def weightFilterData(data, weights=5, rate=0.5):
+    """
+    Filtrerer data ved å bruke en normalistert geometrisk vekting.
+
+    Args:
+        data (list): Liste med numeriske verdier.
+        weights (int): Antall vekter som brukes.
+        rate (float): Rate for endring i geometrisk vekting.
+
+    Returns:
+        filtered_data (list): Filtrert data.
+    """
+    # Lag en normalisert geometrisk vekting
+    weight_values = [(1 - rate) * rate**j for j in range(weights)]
+    normalization_factor = sum(weight_values)
+
+    weight_values = [w / normalization_factor for w in weight_values]  # Normaliser vektene
+
+    filtered_data = data[:]  # Kopier for å ikke endre originalen
+
+    for i in range(1, len(data) - weights):
+        summed = sum(data[i + j] * weight_values[j] for j in range(weights))
+        filtered_data[i] = summed
+
+    return filtered_data
+
+
+
+
+
+def cleanAllData(dData: pd.DataFrame):
     
-    A_omg = 16 # m^2
-    A_eksp = 4 # m^2
+    timeCalibration = 3600 # GMT+1
     
-    alpha = 0.3
-    tau = 0.8
+    dData['time'] = cleanData(
+        pd.to_numeric(dData['time'].astype(int)),
+        lower=1742968800, # 26/04/2025 kl. 07:00
+        upper=1900000000,
+        errors=[],
+        calibration=timeCalibration # Adjust for GMT+1
+    )
+
+    dData['tempIn'] = cleanData(
+        pd.to_numeric(dData['tempIn'].astype(float)),
+        lower=-25,
+        upper=40,
+        errors=[],
+        calibration=0
+    )
+
+    dData['tempOut'] = cleanData(
+        pd.to_numeric(dData['tempOut'].astype(float)),
+        lower=-25,
+        upper=40,
+        errors=[-127, 85],
+        calibration=0
+    )
+
+    dData['batVolt'] = cleanData(
+        pd.to_numeric(dData['batVolt'].astype(float)),
+        lower=2.0,
+        upper=4.5,
+        errors=[],
+        calibration=0
+    )
+
+    dData['light'] = cleanData(
+        pd.to_numeric(dData['light'].astype(int)),
+        lower=0,
+        upper=100_000,
+        errors=[],
+        calibration=0,
+        factor=LUX_CONVERSION
+    )
+
+    
+    # Drop rows where time is nan. These rows can not be used.
+    dData = dData.dropna(subset=['time'])
+
+    return dData
+
+
+
+def combineFromIntervals(dData):
+    """ Combine every set of 5 readings per 4 minutes into the average of those readings."""
+    combinedData = []
+    
+    sums = np.array([0, 0, 0, 0], dtype=float)
+    nums = np.array([0, 0, 0, 0], dtype=int)
+    
+    
+    prevTime = dData["time"].iloc[0]
+    prevSkipTime = 0
+    waitTime = 240 # 4 minutes
     
 
-    hList = []
-    
-    anyHasValue = False
-    
-    for i in range(0, len(dData)):
+    for id, time, *values in dData.itertuples():
         
-        t = dData['time'].iloc[i]
-        if i + 1 == len(dData):
-            hList.append(np.nan)
+        # Row does not have a valid time, skip
+        if np.isnan(time):
             continue
+        
+        # all values in row are NaN, skip 
+        if not np.any(values):
+            continue
+        
+        # Accumulated values
+        for i, v in enumerate(values):
             
+            if not np.isnan(v):
+                sums[i] += v
+                nums[i] += 1
+            
+           
+        # Find the average of the accumulated data
+        if time > prevSkipTime + waitTime:
+            
+            avgs = sums/nums
+            combinedData.append([prevTime, *avgs])
+            
+            prevSkipTime = time
+            
+            # Reset sums and nums
+            sums *= 0
+            nums *= 0
+        
+        
+        prevTime = time
     
-        deltaTime = dData['time'].iloc[i+1] - dData['time'].iloc[i]
-        dTdt = (tempDiff[i+1] - tempDiff[i]) / deltaTime
-        
-        I = dData['light'].iloc[i+1]
-        tDiff = tempDiff.iloc[i]
-
-        # Values where the temperature difference is low are not intereesting.
-        # Cut out all values where either the tmp diff is too low or temp_change is high.
-        # Constant temp is required
-        
-        if abs(dTdt) < 0.01 and dData['tempIn'].iloc[i] > 15:
-            h = ( ( 1-alpha ) * tau * A_eksp * I ) / ( A_omg * tDiff )   
-            anyHasValue = True         
-        
-        else:
-            h = np.nan
-        
-  
-        
-        hList.append(h)
     
-    if anyHasValue:
-        h = np.nanmean(hList)
-    else:
-        h = np.nan
-        
-    return h, hList
+    return pd.DataFrame(combinedData, columns=["time", "tempIn", "tempOut", "light", "batVolt"])
 
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from scipy.stats import linregress
-import numpy as np
+def interpolateData(dData: pd.DataFrame, resolution):
+    
+    time = np.linspace(dData['time'].iloc[0], dData['time'].iloc[-1], resolution)
+    
+    newData = pd.DataFrame({
+        "time": time,
+        "tempIn": np.interp(time, dData['time'], dData['tempIn']),
+        "tempOut": np.interp(time, dData['time'], dData['tempOut']),
+        "light": np.interp(time, dData['time'], dData['light']),
+        "batVolt": np.interp(time, dData['time'], dData['batVolt'])
+    })
+    
+    return newData
+
+
+
+def addGroundTemp(dData):
+    
+    p = 86400 # seconds in a day
+    x = dData['time']
+    tempGround = 3 * np.sin(2 * np.pi / p * (x - p/2)) + (x - x.iloc[0])/p/2 + 10
+    
+    dData['tempGround'] = tempGround
+    
+    return dData
+
+
+# FETCH DRIVHUS DATA AND CLEAN FAULTY READINGS
+def drivhusData(fileName: str = "drivhus.txt", **kwargs):
+
+    print("Henter data for Drivhus")
+    dData = pd.read_csv(fileName, **kwargs)
+    dData.columns = ["time", "tempIn", "tempOut", "light", "batVolt"]
+    
+    # Rense og behandle rå data
+    dData = cleanAllData(dData)
+    dData = combineFromIntervals(dData)
+    
+    resolution = len(dData) * 5 # Øker gjennomsnitllig oppløsning med 5x
+    dData = interpolateData(dData, resolution)
+    
+    dData = addGroundTemp(dData)
+    
+    return dData
+
+
+
+
+
+#%% DATA ANALYSIS
+
 
 def evaluate_params(dData, h_air, h_ground):
     cList = calculateCWithParams(dData, h_air, h_ground)
-    c = np.nanmedian(cList)
-    avg = np.nanmean(cList)
+    c = np.nanmedian(cList)    
+    std = np.nanstd(cList)
     
-    # if c < 0 or avg < 0:
-    #     return None
-
-    c_array = np.array(cList)
-    x = np.arange(len(c_array))
-    valid = ~np.isnan(c_array)
-
-    if np.sum(valid) / len(c_array) < 0.1:
-        return None
+    return c, std, h_air, h_ground, cList
     
-    x_valid = x[valid]
-    c_valid = c_array[valid]
-    
-    slope, intercept, r_value, p_value, std_err = linregress(x_valid, c_valid)
-    r_squared = r_value ** 2
-
-    return r_squared, h_air, h_ground, cList
-
 
 def find_best_h(dData, h_air_range, h_ground_range):
-    best_r2 = -1
+    bestSTD = 1e10
     best_params = (None, None)
     best_cList = None
 
@@ -168,14 +313,13 @@ def find_best_h(dData, h_air_range, h_ground_range):
                 print("No result")
                 continue
             
-            r_squared, h_air, h_ground, cList = result
             
-            if r_squared > best_r2:
-                best_r2 = r_squared
+            c, std, h_air, h_ground, cList = result
+            
+            if c > 0 and std < bestSTD:
+                bestSTD = std
                 best_params = (h_air, h_ground)
                 best_cList = cList
-    
-
 
     return best_params, best_cList
 
@@ -184,22 +328,9 @@ def calculateCWithParams(dData: pd.DataFrame, h_air: float, h_ground: float):
     tempDiff_air = dData['tempIn'] - dData['tempOut']
     tempDiff_ground = dData['tempIn'] - dData['tempGround'] # Ground temp approx
     
-    E_in = 0
-    E_out = 0
-    
-    initTemp = dData['tempIn'].iloc[0] 
-    
-    countedNoLight = 1
-        
-    A_air = 16 # m^2
-    A_floor = 4 # m^2
-    
-    alpha = 0.3
-    tau = 0.8
-    
     cList = []
     
-    resetValues = True 
+    resetValues = True
     
     for i in range(0, len(dData)):
         
@@ -208,25 +339,19 @@ def calculateCWithParams(dData: pd.DataFrame, h_air: float, h_ground: float):
             continue
         
         if resetValues:
-            E_in = 0
-            E_out = 0
+            dQ = 0
             countedNoLight = 0
             initTemp = dData['tempIn'].iloc[i-1]
             
             resetValues = False
         
         
-        
-        # Reset values when the sun sets (with 3 W/m^2 threshold)
+        # Count the number of consecutive data points with low light
         if dData['light'].iloc[i] < 3:
             countedNoLight += 1
-            
-        # Reset values when the tmep starts sinking between 15:00 and 15:10
-        # timeOfDay = dt.fromtimestamp(dData['time'].iloc[i])
-        # if timeOfDay.hour == 15 and timeOfDay.minute > 0 and timeOfDay.minute < 10:
-        #     resetValues = True
-         
         
+            
+        # Reset values when the sun sets (with 3 W/m^2 threshold)
         if dData['light'].iloc[i-1] < 3 and dData['light'].iloc[i] > 3 and countedNoLight > 20:
             resetValues = True
             
@@ -236,24 +361,22 @@ def calculateCWithParams(dData: pd.DataFrame, h_air: float, h_ground: float):
         deltaTime = dData['time'].iloc[i+1] - dData['time'].iloc[i]
         dT = dData['tempIn'].iloc[i] - initTemp - 2 
 
-        E_in += dData['light'].iloc[i] * (1 - alpha) * tau * A_floor * deltaTime
+        dQ += dData['light'].iloc[i] * (1 - ALBEDO) * TRANSMISSION * A_EKSP * deltaTime
         
-        E_out += np.nan_to_num(h_air * tempDiff_air.iloc[i] * A_air * deltaTime)
-        E_out += np.nan_to_num(h_ground * tempDiff_ground.iloc[i] * A_floor * deltaTime)
+        dQ -= np.nan_to_num(h_air * tempDiff_air.iloc[i] * A_AIR * deltaTime)
+        dQ -= np.nan_to_num(h_ground * tempDiff_ground.iloc[i] * A_FLOOR * deltaTime)
 
-        dQ = E_in - E_out
 
-        if abs(dT) > 1:
-            # print(round(dQ, 2), round(dT, 2))
-            C = dQ / dT
-        else:
-            C = np.nan
+
+
+        # Calculate C, but only if the temperature difference is significant
+        if abs(dT) > 1: C = dQ / dT
+        else:           C = np.nan
         
-        if C < -1e6 or C > 1e6:
-            C = np.nan
         
-        # print(C)
-
+        # Filter out extreme values so that the r2-filtering can work
+        if C < -1e6 or C > 1e6: C = np.nan
+        
         cList.append(C)
     
     
@@ -265,316 +388,234 @@ def calculateCWithParams(dData: pd.DataFrame, h_air: float, h_ground: float):
 
 
 
-# # %% INTERPOLER RÅ DATA TIL DAGLIGE VERDIER
-
-# def interpolateDrivhusData(dData, timeStep):
-
-#     # Lag en liste med lister. Hver liste er én dag.
-#     # Hver dag inneholder en liste med lysforoldene for hver spesifikke tid. f.eks. hver time.
-
-#     print("Lager modell for lokale lysforhold.")
-    
-    
-#     # list of the unix-time for seconds 00:00:00 - 23:59:59 at the given resolution
-#     numPerDay = 24*60//timeStep
-#     dayTimeList = np.linspace(0, 86400, num=numPerDay, endpoint=False)
-    
-
-#     daysDict = dict()
-#     timesDaysList = dict()
-
-#     tempInList = list()
-#     tempOutList = list()
-#     insolationList = list()
-
-
-#     # Lagre alle verdiene i tidslista ut ifra hvilken dag på året de er i.
-#     for index, unixTime in dData['time'].items():
-
-#         time = dt.fromtimestamp(unixTime)
-#         dayNum = time.timetuple().tm_yday
-        
-#         twleveOCLock = dt(time.year, time.month, time.day, 3, 0, 0).timestamp() # two hours forward; GMT+1 and summer time
-        
-#         timeOfDay = dData['time'][index] - twleveOCLock
-#         timesDaysList.setdefault(dayNum, []).append(timeOfDay)
-        
-#         tempIn = dData['tempIn'][index]
-#         tempOut = dData['tempOut'][index]
-#         insolation = dData['light'][index]
-        
-#         daysDict.setdefault(dayNum, []).append([tempIn, tempOut, insolation])
-        
-    
-    
-#     # Lag interpolerte lister for hver dag
-#     for day in daysDict.keys():
-
-
-#         interpTempIn = np.interp(dayTimeList, timesDaysList[day], [x[0] for x in daysDict[day]], np.nan, np.nan)
-#         interpTempOut = np.interp(dayTimeList, timesDaysList[day], [x[1] for x in daysDict[day]], np.nan, np.nan)
-#         interpInsolation = np.interp(dayTimeList, timesDaysList[day], [x[2] for x in daysDict[day]], np.nan, np.nan)
-        
-        
-#         insolationList.append(interpInsolation)
-#         tempInList.append(interpTempIn)
-#         tempOutList.append(interpTempOut)
-        
-        
-
-#     # Prepare data to plot
-
-#     x = np.array([[i]*len(dayTimeList) for i in timesDaysList.keys()]).flatten()    
-#     y = np.array([dayTimeList]*len(timesDaysList)).flatten()/3600
-
-
-#     zTempIn = np.array(tempInList).flatten()
-#     zTempOut = np.array(tempOutList).flatten()
-#     zInsolation = np.array(insolationList).flatten()
-    
-    
-    
-    
-#     return x, y, zTempIn, zTempOut, zInsolation
-
-
-
-
-# #%% MODELL FOR LOKALE LYSFORHOLD
-
-# def fitLocalCloudCover():
-#     """TODO
-#     """
-#     #--- LYS: Bruk regresjon for å finne tilpassede linjer for hvert klokkelsett
-    
-#     # empiricalToExpectedRatio = empiricalZ / expectedZ
-    
-#     def fitFunc(x, a, b):
-#         # Lag en funksjon som passer med buen som lyset lager gjennom året. 
-#         return a*x + b
-        
-
-#     # dayParams = []
-
-#     # for i, time in enumerate(timeList):
-#     #     lightsAtTime = []
-        
-#     #     for day in empiricalDaysList:
-#     #         lightsAtTime.append(day[i])
-        
-#     #     x_data = np.array([i for i in range(len(lightsAtTime))])
-#     #     y_data = lightsAtTime
-        
-        
-        
-#     #     params, covariance = curve_fit(fitFunc, x_data, y_data)
-#     #     a, b = params
-        
-#     #     dayParams.append(params)
-
-
-#     # print(dayParams)
-
-
-
-
-#     # Lag en funksjon for en linje som passer gjennom lysforholdet for alle dagene på de spesifikke tidene.
-#     # F.eks. en funksjon som passer for lysforholdet kl. 08:00.
-#     # Siden solen går opp tidligere om sommeren, vil denne måten finne en fuksjon som passer for data som går gjennom alle tider i året.
-#     # lagre parameterne for funksjonen i hvert klokkeslett.
-
- 
-
-
 # # %% MODELL for forventet lysmengde uavhengig av målte data
 
 def modelInsolation(xTime, lat, lon):
-
     zInsolation = []
-    zSolarAngle = []
 
     for i, t in enumerate(xTime):
         day = dt.fromtimestamp(t).timetuple().tm_yday
-        t -= 3600 * 2 # GMT+1 sumemr time
+        t -= 3600 * 2 # GMT+1 summer time
         
+        # Solar angle theta
         theta = getSunAngleDeg(t, lat, lon, d=day)
-        
-        zSolarAngle.append(theta)
-        zInsolation.append(getInsolationAt(theta, day))
+    
+        zInsolation.append(getInsolation(theta))
             
     
-    return np.array(zSolarAngle), np.array(zInsolation)
+    return np.array(zInsolation)
 
 
-
-
-# # %% MODELL for gjennomsnittstemperatur gjennom året
-
-# def modelDayTemps(dayTimeList, highs, lows, lat, lon):
-
-#     def dayTempModel(x, high, low, highTime, lowTime):
-                
-#         A = (high - low) / 2
-#         d = (high + low) / 2
-        
-#         upPeriod = (highTime-lowTime) * 2
-#         downPeriod = (24 - highTime + lowTime) * 2
-
-        
-#         if x < lowTime:
-#             sine = np.sin(2*np.pi/downPeriod * (x - lowTime - downPeriod/4))
-        
-#         elif lowTime <= x <= highTime:
-#             sine = np.sin(2*np.pi/upPeriod * (x - lowTime - upPeriod/4))
-        
-#         else:
-#             sine = np.sin(2*np.pi/downPeriod * (x - highTime + downPeriod/4))
-
-#         return A * sine + d
-        
-
-#     monthList = np.linspace(1, 12, 12, endpoint=True)/12 * 365
-#     yearList = np.linspace(1, 365, 365, endpoint=True)
-
-
-#     interpolatedLows = np.interp(yearList, monthList, lows)
-#     interpolatedHighs = np.interp(yearList, monthList, highs)
-
-
-
-#     z = []
-
-#     for d in range(0, 365):
-                
-#         sunRiseTime = getFirstSunRiseTime(day=d, timeList=dayTimeList, lat=lat, lon=lon)
-#         sunRiseTime = sunRiseTime / 3600 + 0.5 # Convert from seconds to hours and add half an hour.
-        
-        
-#         for i, timeSec in enumerate(dayTimeList):
-            
-#             # (?) Add support for adding registered temperature data to the data set: (example from cloud coverage)
-            
-#             # if d in cloudDaysList.keys():
-#             #     cloudPercent = cloudDaysList[d][i]/100
-            
-#             # else:
-#             #     cloudPercent = 1 - clearPercent(d)/100
-            
-#             timeHour = timeSec / 3600
-#             temp = dayTempModel(timeHour, interpolatedHighs[d], interpolatedLows[d], highTime = 15, lowTime=sunRiseTime)
-            
-#             z.append(temp)
-
-
-
-#     z = np.array(z)
-
-#     return z
-
-
-
-
-# # %% MODELL FOR ENDRING AV INNETEMPERATUR
-# def fitTempChange(dData, resolution=100, radius=5):
-
-#     print("Lager modell for endring av innetemperatur.")
-
-#     # Interpoler temp inne, temp ute og lysmengde
-#     # Dette gir et datasett med jevne mellomrom over alle verdier.
-
-#     start = dData['time'].iloc[0]
-#     stop = dData['time'].iloc[-1]
+#%% PLOTTING
+def plotD(dData: pd.DataFrame, yInsolationModel: np.ndarray, saveFig: bool = True):
+    """ Plot all data from the Drivhus """
     
-#     interpolationTimeSet = np.linspace(start=start, stop=stop, num=resolution, dtype=int, endpoint=True)
-
-
-#     lightInterpolated = np.interp(interpolationTimeSet, dData['time'], dData['light'])
-#     tempInInterpolated = np.interp(interpolationTimeSet, dData['time'], dData['tempIn'])
-#     tempOutInterpolated = np.interp(interpolationTimeSet, dData['time'], dData['tempOut'])
-
-
-#     tempDiff = tempInInterpolated - tempOutInterpolated
-#     tempChange = np.zeros(resolution)
-
-
-#     def linearFitFunc(x, a, b):
-#         return a*x + b
-
-
-#     for i in range(0, resolution):
-        
-#         temps = tempInInterpolated[max(i-radius, 0) : min(i+radius+1, resolution-1)]
-#         xList = [x for x in interpolationTimeSet[max(i-radius, 0) : min(i+radius+1, resolution-1)]]
-#         params, _ = curve_fit(linearFitFunc, xList, temps)
-#         a, b = params
-        
-#         tempChange[i] = a
-
-
+    DPI = 600
+    
+    x = pd.to_datetime(dData['time'].astype(int), unit='s') 
+    
+    yTempIn = dData['tempIn']
+    yTempOut = dData['tempOut']
+    yTempGround = dData['tempGround']
+    yBatVolt = dData['batVolt']
+    yInsolation = dData['light']
+    yInsolationModel = yInsolationModel
     
 
-#     df = pd.DataFrame({
-#         "temp_diff": tempDiff,
-#         "light_in": lightInterpolated,
-#         "temp_change": tempChange*timeStep*60   # Konverter til "temp-change per timeStep minutter"
-#     })
+
+    # Battery Voltage
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("Battery Voltage")
+
+    ax.plot(x, yBatVolt, ".", label="Battery Voltage", color="navajowhite")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Battery Voltage [V]", color="black")
+    # ax.set_ylim(2.5, 4.5)
+    plt.title("Battery Voltage")
+    ax.legend(loc='upper left')
+    
+    if saveFig: plt.savefig("plots/Battery Voltage.png", dpi=DPI, bbox_inches='tight')
+
+
+    # Temp In
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("Temp In")
+
+    ax.plot(x, yTempIn, "-", label="Inside Temperature", color="red")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Temperature [°C]", color="black")
+    ax.set_ylim(-15, 45)
+    plt.title("Temp In")
+    ax.legend(loc='upper left')
+
+    if saveFig: plt.savefig("plots/Temp In.png", dpi=DPI, bbox_inches='tight')
+
+
+    # Temp In and Out
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("Temp In and Out")
+
+    ax.plot(x, yTempIn, "-", label="Inside Temperature", color="red")
+    ax.plot(x, yTempOut, "-", label="Outside Temperature", color="blue")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Temperature [°C]", color="black")
+    # ax.set_ylim(-15, 45)
+    plt.title("Temp In and Out")
+    ax.legend(loc='upper left')
+
+    if saveFig: plt.savefig("plots/Temp In and Out.png", dpi=DPI, bbox_inches='tight')
+    
+
+
+    # Temperature Difference
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("Temperature Difference")
+
+    temp_diff = yTempIn - yTempOut
+    ax.plot(x, temp_diff, ".", label="Temperature Difference", color="green")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Temperature Difference [K]", color="black")
+    # ax.set_ylim(-5, 25)
+    plt.title("Temperature Difference")
+    ax.legend(loc='upper left')
+
+    if saveFig: plt.savefig("plots/Temperature Difference.png", dpi=DPI, bbox_inches='tight')
+
+
+    # Modelled Temperature in Ground
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("Modelled Temperature in Ground")
+
+    ax.plot(x, yTempGround, ".", label="Modelled Ground Temp", color="purple")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Temperature [°C]", color="black")
+    # ax.set_ylim(-15, 45)
+    plt.title("Modelled Temperature in Ground")
+    ax.legend(loc='upper left')
+
+    if saveFig: plt.savefig("plots/Modelled Temperature in Ground.png", dpi=DPI, bbox_inches='tight')
+
+
+    # All Temperatures
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("All Temperatures")
+
+    ax.plot(x, yTempOut, ".", label="Outside Temperature", color="blue")
+    ax.plot(x, yTempIn, ".", label="Inside Temperature", color="red")
+    ax.plot(x, yTempGround, ".", label="Ground Temperature", color="purple")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Temperature [°C]", color="black")
+    # ax.set_ylim(-15, 45)
+    plt.title("All Temperatures")
+    ax.legend(loc='upper left')
+
+    if saveFig: plt.savefig("plots/All Temperatures.png", dpi=DPI, bbox_inches='tight')
+
+
+    # Measured Light
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("Measured Light")
+
+    ax.plot(x, yInsolation / LUX_CONVERSION, ".", label="Measured Light", color="orange")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Illuminance [Lx]", color="black")
+    # ax.set_ylim(0, 6500)
+    plt.title("Measured Light")
+    ax.legend(loc='upper left')
+
+    if saveFig: plt.savefig("plots/Measured Light.png", dpi=DPI, bbox_inches='tight')
+
+
+    # Adjusted Light
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("Adjusted Light")
+
+    ax.plot(x, yInsolation, ".", label="Adjusted Light", color="orange")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Insolation [W/m²]", color="black")
+    # ax.set_ylim(0, 1400)
+    plt.title("Adjusted Light")
+    ax.legend(loc='upper left')
+
+    if saveFig: plt.savefig("plots/Adjusted Light.png", dpi=DPI, bbox_inches='tight')
+
+
+    # Adjusted Light and Model
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("Adjusted Light and Model")
+
+    ax.plot(x, yInsolation, ".", label="Adjusted Light", color="orange")
+    ax.plot(x, yInsolationModel, "-", label="Insolation Model", color="yellow")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Insolation [W/m²]", color="black")
+    # ax.set_ylim(0, 1400)
+    plt.title("Adjusted Light and Model")
+    ax.legend(loc='upper left')
+
+    if saveFig: plt.savefig("plots/Adjusted Light and Model.png", dpi=DPI, bbox_inches='tight')
     
     
-#     # Definer X (uavhengige variabler) og legg til konstant
-#     X = df[["temp_diff", "light_in"]]
-#     X = sm.add_constant(X)  # Legger til en konstant for skjæringspunktet
+    # Temps and Light
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("Temps and Light")
 
-#     # Bygg og tilpass modellen
-#     model = sm.OLS(df["temp_change"], X).fit()
+    ax.plot(x, yTempOut, ".", label="Outside Temp", color="blue")
+    ax.plot(x, yTempIn, ".", label="Inside Temp", color="red")
+    ax2 = ax.twinx()
+    ax2.plot(x, yInsolation, ".", label="Light", color="orange")
 
-#     return df, model
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Temperature [°C]", color="black")
+    # ax.set_ylim(-15, 45)
+    ax2.set_ylabel("Insolation [W/m²]", color="black")
+    # ax2.set_ylim(0, 1400)
+    plt.title("Temps and Light")
 
+    lines, labels = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines + lines2, labels + labels2, loc='upper left')
 
-
-
-# # %% SIMULERING
-# def simulateTemperature(dayTimeList, zTemps, zLight, tempChangeModel, lat, lon):
+    if saveFig: plt.savefig("plots/Temps and Light.png", dpi=DPI, bbox_inches='tight')
     
-#     numPerDay = len(dayTimeList)
+
+def plotC(cData: dict, saveFig: bool = True):
+    DPI = 600
     
-#     intercept, coef_temp_diff, coef_insolation = tempChangeModel.params
     
-#     z = []
+    x = list(pd.to_datetime(cData['x'].astype(int), unit='s'))
     
-#     for d in range(0, 365):
-        
-#         currentTemp = 0
-         
-#         sunRiseTimeSec = getFirstSunRiseTime(day=d, timeList=dayTimeList, lat=lat, lon=lon)
+    cList = cData['cList']
+    cListClean = cData['cListClean']
+    c = cData['c']
+    cSTD = cData['cSTD']
 
-        
-#         for i, timeSec in enumerate(dayTimeList):
-            
-#             outsideTemp = zTemps[numPerDay*d + i]
-#             insolation = zLight[numPerDay*d + i]
-            
-#             # Let the inside temp follow the outside temp down until sunrise.
-#             # The temperatures should be approximately the same after a night with no light
-#             if timeSec < sunRiseTimeSec:                
-#                 currentTemp = outsideTemp
+    # Raw C
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("Raw C")
 
-#             else:    
-#                 temp_diff = currentTemp - zTemps[numPerDay*d + i]
-#                 predicted_temp_change = intercept + coef_temp_diff * temp_diff + coef_insolation * insolation
-#                 currentTemp += predicted_temp_change
-                
-#             z.append(currentTemp)
-        
-        
-#     z = np.array(z)
-    
-#     return z
+    ax.plot(x, cList, ".", label="Raw C", color="lightblue")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("C [J/K]", color="black")
+    ax.set_ylim(0, 1e6)
+    plt.title("Raw C")
+    ax.legend(loc='upper left')
 
+    if saveFig: plt.savefig("plots/Raw C.png", dpi=DPI, bbox_inches='tight')
 
+    # Clean C
+    fig, ax = plt.subplots(figsize=(12, 8))
+    fig.canvas.manager.set_window_title("Calculated C and Standard Deviation")
 
+    ax.plot(x, cListClean, ".", label="C", color="lightblue")
+    ax.hlines(c, x[0], x[-1], colors='b', linestyles='-')
+    ax.hlines([c + cSTD, c - cSTD], x[0], x[-1], colors='g', linestyles='--')
+    ax.set_xlabel("Time")
+    ax.set_ylabel("C [J/K]", color="black")
+    ax.set_ylim(0, 1e6)
+    plt.title("Calculated C and Standard Deviation")
+    ax.legend(loc='upper left')
 
-
-#%%
+    if saveFig: plt.savefig("plots/Clean C.png", dpi=DPI, bbox_inches='tight')
 
 
 
@@ -583,187 +624,135 @@ def modelInsolation(xTime, lat, lon):
 # %%
 if __name__ == "__main__":
     
-    
     # Location of Drivhus at Skien VGS
     lat = 59.200
     lon = 9.612
     
     
-    # Fetch data from Drivhus
-    dData = drivhusData(fileName="DATALOG.TXT")
-    
-    ySunAngle, yInsolationModel = modelInsolation(dData['time'], lat, lon)
+    # Fetch data from Drivhus and model insolation
+    dData = drivhusData(fileName="Blu1_DATALOG220425.TXT")
+    yInsolationModel = modelInsolation(dData['time'], lat, lon)
 
-    dDataFirst = dData.iloc[:10000]
-    dDataSecond = dData.iloc[10000:]
     
     cList = []
-    fullCList = []
-
-    # Toggle this to either search for h or use own values
-    if searchForH := False:
+    xCList = []
+    
+    
+    parts = {
+        "first": {
+            "start": 0,
+            "end": 10000,
+  
+            "h_air": 1.47241,
+            "h_ground": 8.12069,
+            "h_air_range": np.linspace(0, 6, 30),
+            "h_ground_range": np.linspace(8, 15, 30),
+        },
+        "second": {
+            "start": 10000,
+            "end": 18000,
+        
+        # Funnet manuelt 2 og 6.
+        # Dårlige resultater, små variasjoner i U hjelper ikke
+            "h_air": 2,
+            "h_ground": 6,
+            "h_air_range": np.linspace(1, 3, 30),
+            "h_ground_range": np.linspace(5, 7, 30),
+        },
+        "third": {
+            "start": 18000,
+            "end": len(dData),
             
-        # Intervals for first half of data set. 
-        h_air_range = np.linspace(1, 2, 25)
-        h_ground_range = np.linspace(8, 12, 50)
-                
-        (h_air_first, h_ground_first), cListFirst = find_best_h(dDataFirst, h_air_range, h_ground_range)
-        
-        
-        # Intervals for first half of data set.
-        h_air_range = np.linspace(0, 10, 50)
-        h_ground_range = np.linspace(0, 10, 50)
-        
-        (h_air_second, h_ground_second), cListSecond = find_best_h(dDataSecond, h_air_range, h_ground_range)
+            "h_air": 5.03448,
+            "h_ground": 9.3448,
+            "h_air_range": np.linspace(4, 6, 30),
+            "h_ground_range": np.linspace(7, 11, 30),
+        }
+    }
 
-        
+    # Toggle to either search for h values or use the given ones
+    if searchForH := False:
+        for key, part in parts.items():
+            start = part['start']
+            end = part['end']
+            
+            xList = dData.iloc[start : end]['time']
+
+            # Find the best h values and calculate C
+            (h_air, h_ground), cListPart = find_best_h(
+                dData.iloc[start : end],
+                part['h_air_range'],
+                part['h_ground_range']
+            )
+            
+            # Save the results
+            part["h_air"] = h_air
+            part["h_ground"] = h_ground
+
+            cList.extend(cListPart)
+            xCList.extend(xList)
+            
+    
     else:
-        # First 10 000 entries, then the rest ~8400
+        for key, part in parts.items():
+            start = part['start']
+            end = part['end']
+            
+            xList = dData.iloc[start : end]['time']
+            
+            # Calculate C with the given h values
+            cListPart = calculateCWithParams(
+                dData.iloc[start : end],
+                part['h_air'],
+                part['h_ground']
+            )
+                        
+            cList.extend(cListPart)
+            xCList.extend(xList) 
         
-        h_air_first = 1.95
-        h_ground_first = 8.1
-        h_air_second = 0.0
-        h_ground_second = 3.06
+    
+    
+    cListClean = cleanData(cList, lower=-1e5, upper=1e6, upperDerivative=5000)
+    
+    # Calculate median and std
+    c = np.nanmedian(cListClean)
+    cSTD = np.nanstd(cListClean)
+    
+    
+    print(np.average([1.5, 2, 5]))
+    print(np.average([8.1, 6, 9.3]))
+    
+    print(np.std([1.5, 2, 5]))
+    print(np.std([8.1, 6, 9.3]))
+    
+    cData = {
+        "x": np.array(xCList),
+        "cList": cList,
+        "cListClean": cListClean,
+        "c": c,
+        "cSTD": cSTD
+    }
+
+
+    # Print the results
+    for key, part in parts.items():
+        print(f"{key}:")
+        print(f"  U_air: {part['h_air']}")
+        print(f"  U_ground: {part['h_ground']}")
+        print()
         
-        # Add the first and second parts
-        cListFirst = calculateCWithParams(dData[:10000], h_air_first, h_ground_first)
-        cListSecond = calculateCWithParams(dData[10000:], h_air_second, h_ground_second)
-    
-
-    cListFirstClean = cleanData(cListFirst, lower=-100_000, upper=400_000, upperDerivative=5000)
-    cListSecondClean = cleanData(cListSecond, lower=0, upper=300_000, upperDerivative=5000)
-        
-
-    # Median and Standard Deviation for each
-    cFirst = np.nanmedian(cListFirstClean)
-    cSTDFirst = np.nanstd(cListFirstClean)
-    
-    cSecond = np.nanmedian(cListSecondClean)
-    cSTDSecond = np.nanstd(cListSecondClean)
-    
-    print("h_air_first: ", h_air_first)
-    print("h_ground_first: ", h_ground_first)
-    
-    print("h_air_second: ", h_air_second)
-    print("h_ground_second: ", h_ground_second)
-    
-    print(f"First Median: {cFirst}")
-    print(f"First STD: {cSTDFirst}")
-    print(f"Second Median: {cSTDSecond}")
-    print(f"Second STD: {cSecond}")
-    
-
-    # Time as dateTime-objects for plotting raw data
-    # xTimeRawDrivhus = dData['time']
-    xTimeRawDrivhus = pd.to_datetime(dData['time'].astype(int), unit='s') 
-    
-
-
-
-    # Plot all the models and simulation temperature
-    print("Plotter grafer")
-    
-    # Battery Voltage
-    # plotRawData(xTimeRawDrivhus, yBatVolt=dData['batVolt'])
-    
-    # Temperatures
-    # plotData("Temp Out", xTimeRawDrivhus, yTempOut=dData['tempOut'])
-    # plotData("Temp In", xTimeRawDrivhus, yTempIn=dData['tempIn'])
-    # plotData("Temp In and Out", xTimeRawDrivhus, yTempOut=dData['tempOut'], yTempIn=dData['tempIn'])
-    # plotData("Temperature Difference", xTimeRawDrivhus, yTempDiff = dData['tempIn']-dData['tempOut'])
-    # plotData("Modelled Temperature in Ground", xTimeRawDrivhus, yTempGround=dData['tempGround'])
-    # plotData("All Temperatures", xTimeRawDrivhus, dData['tempOut'], dData['tempIn'], yTempGround=dData['tempGround'])
-    
-    # # Light
-    # plotData("Measured Light", xTimeRawDrivhus, yInsolation=dData['light'])
-    # plotData("Light vs. Model", xTimeRawDrivhus, yInsolation=dData['light'], yInsolationModel=yInsolationModel)
-    
-    # plotData("Temps and Light", xTimeRawDrivhus, dData['tempOut'], dData['tempIn'], dData['light'])
-    
-
-
-
-    # C First Raw and Clean
-    label = f"Raw C, h_air = {round(h_air_first, 3)}, h_ground = {round(h_ground_first, 3)}" 
-    plotData(label, xTimeRawDrivhus[:10000], yC=cListFirst, h_air=h_air_first, h_ground=h_ground_first)
-    plotData("Temperatures and Raw C", xTimeRawDrivhus[:10000], dDataFirst['tempOut'], dDataFirst['tempIn'], yTempGround=dDataFirst['tempGround'], yC=cListFirst)
-    
-    label = f"Clean C, C = {round(cFirst)}, STD = {round(cSTDFirst)}"
-    plotData(label, xTimeRawDrivhus[:10000], yC=cListFirstClean, cLine=cFirst, cSTD=cSTDFirst)
-    
-    # C Second Raw and Clean
-    label = f"Raw C, h_air = {round(h_air_second, 3)}, h_ground = {round(h_ground_second, 3)}"
-    plotData(label, xTimeRawDrivhus[10000:], yC=cListSecond, h_air=h_air_second, h_ground=h_ground_second)
-    plotData("Temperatures and Raw C", xTimeRawDrivhus[10000:], dDataSecond['tempOut'], dDataSecond['tempIn'], yTempGround=dDataSecond['tempGround'], yC=cListSecond)
-    
-    label = f"Clean C, C = {round(cSecond)}, STD = {round(cSTDSecond)}"
-    plotData(label, xTimeRawDrivhus[10000:], yC=cListSecondClean, cLine=cSecond, cSTD=cSTDSecond)
-
+    print(f"  c: {c}")
+    print(f"  cSTD: {cSTD}")
     
     
     
-    # def ## OLD CODE -------
+    #%% plot all
     
-    
-    
-    # Time step
-    # timeStep = 60 # minutes
-    # rawInterpTimeStep = 5 # minutes
-    
-    # list of the unix-time for seconds 00:00:00 - 23:59:59 at the given resolution
-    # numPerDay = 24*60//timeStep
-    # dayTimeList = np.linspace(0, 86400, num=numPerDay, endpoint=False)
-
-    # # X og Y koordinater for plotting av et helt år med data
-    # xFullYear = np.array([[i]*numPerDay for i in range(1, 366)]).flatten()
-    # yFullYear = np.array([dayTimeList]*365).flatten()/3600
-
-
-    # startID = 19989 # ID for the first row in "drivhus"
-    # startID = 0
-    
-    
-    # xMET, _, yMETCloud = METData("sigMet.json", lat, lon)
-    
-
-    # dataByDay = structureByDay(dData)
-
-
-    # Månedlige høy- og lavtemperaturer for Skien
-    # TODO: hente inn bedre data og legge tilrette for tilsvarende funksjon
-    # highs = [-1.8, -0.9, 3.5, 9.1, 15.5, 20.4, 21.5, 20.1, 15.1, 9.3, 3.2, -0.5]
-    # lows =  [-6.8, -6.8, -3.3, 0.8, 5.5, 10.5, 12.2, 11.3, 7.5, 3.8, -1.5, -5.6]
-    
-    
-    
-    # plotInterpolatedTemperatures(xRawInterp, yRawInterp, zRawInterpTempOut, zRawInterpTempIn)
-    # plotInterpolatedInsolation(xRawInterp, yRawInterp, zRawInterpInsolation)
-    # plotInterpolatedTempDiff(xRawInterp, yRawInterp, zRawInterpTempIn - zRawInterpTempOut)
-    
-    # plotAllLight(xRawInterp, yRawInterp, zRawInterpInsolation, xFullYear, yFullYear, zInsolation)
-    
-    # plotSolarAngleModel(xFullYear, yFullYear, zSolarAngle)
-    # plotCloudCoverModel(xFullYear, yFullYear, zCloud)
-    # plotInsolationModel(xFullYear, yFullYear, zInsolation)
-    
-    # plotTempChangeModel(tempChangeDF, tempChangeModel, timeStep)
-    
-    # plotTemperatures(xFullYear, yFullYear, zAirTemps, zDrivhusTemps)
-    
-    # analyze(dData, dayTimeList, xMET, yMETCloud, lat, lon)
-    # exit()
-    
-    # xRawInterp, yRawInterp, zRawInterpTempIn, zRawInterpTempOut, zRawInterpInsolation = interpolateDrivhusData(dData, rawInterpTimeStep)
-    # zCloud, zSolarAngle, zInsolation = modelInsolation(xMET, yMETCloud, dayTimeList)
-    
-    
-    # Create models of data
-    # tempChangeDF, tempChangeModel = fitTempChange(dData, resolution=10000, radius=10)
-    # zAirTemps = modelDayTemps(dayTimeList, highs, lows, lat, lon)
-    
-    # Simulate indoor temperature
-    # zDrivhusTemps = simulateTemperature(dayTimeList, zAirTemps, zInsolation, tempChangeModel, lat, lon)
-    
+    plotD(dData, yInsolationModel, saveFig=False)
+    plotC(cData, saveFig=False)
     
     plt.show()
-
+    
+    
+    
+    
