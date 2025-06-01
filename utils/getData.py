@@ -1,218 +1,131 @@
-import requests
 import numpy as np
-from datetime import datetime as dt, timedelta
-import json
 import pandas as pd
 
-def fetchDrivhusData(firstID=0):
-    
-    
-    drivhusURL = 'https://drivhus.bluwo.me/get_data.php'
-    data = {
-        "fromID": firstID
-    }
-    
-    response = requests.post(drivhusURL, json=data)
-    statusCode = response.status_code
-    
-    match statusCode:
-        case 200:
-            data = response.json()
-            
-            if len(data) == 0:
-                print("No data from Drivhus.")
-                return []
-            
-            
-            print(f"Received {len(data)} rows from Drivhus.")
-            
-            return data
-        
-        case _:
-            print(f"Got status code {statusCode} and body {response.text} from Drivhus")
-        
-def cleanData(data, lower, upper, errors=[], calibration=0):
- 
-    cleansedData = []
-    for value in data:
+from utils.settingsAndConstants import LUX_CONVERSION
+
+
+
+def cleanData(data, lower, upper, errors=[], calibration=0, factor=1, lower_derivative=None, upper_derivative=None):
+    cleansed_data = []
+    for i, value in enumerate(data):
         invalid = \
             (value in errors) or \
             value < lower or \
             value > upper or \
             np.isnan(value)
+            
+        # Add derivative thresholds
+        if lower_derivative is not None and i < len(data) - 2:
+            if abs(np.nan_to_num(data[i+1] - value)) < lower_derivative:
+                invalid = True
+                
+        if upper_derivative is not None and i < len(data) - 2:
+            if abs(np.nan_to_num(data[i+1] - value)) > upper_derivative:
+                invalid = True
         
-        cleansedData.append(np.nan if invalid else value + calibration)
+        cleansed_data.append(np.nan if invalid else (value + calibration) * factor)
 
-    return cleansedData
-
-
+    return cleansed_data
 
 
-def openStoredData(filename) -> dict:
-    with open(filename, 'r') as read_file:
-        storedData: dict = json.load(read_file)
-        return storedData
-    
-def saveUpdatedData(filename, data) -> None:
-    with open(filename, 'w') as write_file:
-        json.dump(data, write_file, indent=4)
 
-def hasMETExpired(data: dict) -> bool:
-    expiresDateTime = dt.strptime(data.get("Expires"), "%a, %d %b %Y %H:%M:%S %Z") + timedelta(hours=1) # GMT+1
-    
-    if dt.now() < expiresDateTime:
-        return False
-    
-    return True
+def weightFilterData(data, weights=5, rate=0.5):
+    """
+    Filtrerer data ved å bruke en normalistert geometrisk vekting.
 
+    Args:
+        data (list): Liste med numeriske verdier.
+        weights (int): Antall vekter som brukes.
+        rate (float): Rate for endring i geometrisk vekting.
 
-def fetchMETData(fileName, lat, lon):
-    storedData: dict = openStoredData(fileName)
+    Returns:
+        filtered_data (list): Filtrert data.
+    """
+    # Lag en normalisert geometrisk vekting
+    weight_values = [(1 - rate) * rate**j for j in range(weights)]
+    normalization_factor = sum(weight_values)
 
-    if not hasMETExpired(storedData):
-        print("Weather data has NOT expired. Using stored data.")
-        return storedData
+    weight_values = [w / normalization_factor for w in weight_values]  # Normaliser vektene
 
-    
-    
-    print("Weather data HAS expired. Fetching new data.")
-    
-    lastModifiedTime = storedData.get("last-modified")
-    MET_URL = f'https://api.met.no/weatherapi/locationforecast/2.0/compact?lat={lat}&lon={lon}&altitude=4' # Langesund Coordinates
-    headers = {
-        'User-Agent': 'Blus Drivhus 1.0',
-        'From': 'bluwo.me',
-        'If-Modified-Since': lastModifiedTime
-    }
-    
-    response = requests.get(MET_URL, headers=headers)
-    statusCode = response.status_code
-    
-    # Handle and early return failed requests
-    if statusCode != 200:
-        if statusCode == 304:
-            print("Weather data has not been updated since last fetch. Using previously downloaded data.")
-            return storedData
-        else:
-            print(f"Got status code {statusCode} and body '{response.text}'")
-            return None
-        
+    filtered_data = data[:]  # Kopier for å ikke endre originalen
 
-    MET_data = response.json()
-    
-    # Update the Expires and last-modified fields
-    storedData['Expires'] = response.headers.get("Expires")
-    storedData['last-modified'] = response.headers.get("last-modified")
-    
-    
-    # This removes the values that is replaced by the incoming values 
-    existingTimes = list(map(lambda x: int(x), storedData['rows'].keys()))
-    firstTime = int(dt.fromisoformat(MET_data['properties']['timeseries'][0]['time']).timestamp())
+    for i in range(1, len(data) - weights):
+        summed = sum(data[i + j] * weight_values[j] for j in range(weights))
+        filtered_data[i] = summed
 
-    for time in existingTimes:
-        if time >= firstTime:
-            storedData['rows'].pop(str(time))
-    
-    
-    
-    # Insert the new values
-    for hour in MET_data['properties']['timeseries']:
-        time = int(dt.fromisoformat(hour['time']).timestamp())
-        MET_row = hour['data']['instant']['details']
-        
-        row = {
-            'temp': MET_row['air_temperature'],
-            'cloud': MET_row['cloud_area_fraction']
-        }
-        
-        storedData['rows'].update({str(time): row})
-    
-    
-    saveUpdatedData(fileName, storedData)
-
-    return storedData
-
-def METData(fileName, lat, lon):
-    data: dict = fetchMETData(fileName, lat, lon)['rows']
-    
-    xMET = []
-    yMETTemp = []
-    yMETCloud = []
-    
-    for time, values in data.items():
-        xMET.append(int(dt.fromtimestamp(int(time)).timestamp()))
-        
-        yMETTemp.append(values['temp'])
-        yMETCloud.append(values['cloud'])    
-    
-    return pd.Series(xMET), pd.Series(yMETTemp), pd.Series(yMETCloud)
-  
+    return filtered_data
 
 
-def cleanAllData(dData):
+
+
+
+def cleanAllData(d_data: pd.DataFrame):
     
-    timeCalibration = 3600
+    time_calibration = 3600 # GMT+1
     
-    
-    dData['time'] = cleanData(
-        pd.to_numeric(dData['time'].astype(int)),
+    d_data['time'] = cleanData(
+        pd.to_numeric(d_data['time'].astype(int)),
         lower=1700000000,
         upper=1900000000,
         errors=[],
-        calibration=timeCalibration # Adjust for GMT+1
+        calibration=time_calibration # Adjust for GMT+1
     )
 
-    dData['tempIn'] = cleanData(
-        pd.to_numeric(dData['tempIn'].astype(float)),
+    d_data['tempIn'] = cleanData(
+        pd.to_numeric(d_data['tempIn'].astype(float)),
         lower=-25,
         upper=40,
         errors=[],
         calibration=0
     )
 
-    dData['tempOut'] = cleanData(
-        pd.to_numeric(dData['tempOut'].astype(float)),
+    d_data['tempOut'] = cleanData(
+        pd.to_numeric(d_data['tempOut'].astype(float)),
         lower=-25,
         upper=40,
         errors=[-127, 85],
         calibration=0
     )
 
-    dData['batVolt'] = cleanData(
-        pd.to_numeric(dData['batVolt'].astype(float)),
+    d_data['batVolt'] = cleanData(
+        pd.to_numeric(d_data['batVolt'].astype(float)),
         lower=2.0,
         upper=4.5,
         errors=[],
         calibration=0
     )
 
-    dData['light'] = cleanData(
-        pd.to_numeric(dData['light'].astype(int)),
+    d_data['light'] = cleanData(
+        pd.to_numeric(d_data['light'].astype(int)),
         lower=0,
         upper=100_000,
         errors=[],
-        calibration=0
+        calibration=0,
+        factor=LUX_CONVERSION
     )
 
-
-    return dData
-
-
-
-def combineFromIntervals(dData):
     
-    combinedData = []
+    # Drop rows where time is nan. These rows can not be used.
+    d_data = d_data.dropna(subset=['time'])
+
+    return d_data
+
+
+
+def combineFromIntervals(d_data):
+    """ Combine every set of 5 readings per 4 minutes into the average of those readings."""
+    combined_data = []
     
     sums = np.array([0, 0, 0, 0], dtype=float)
     nums = np.array([0, 0, 0, 0], dtype=int)
     
     
-    prevTime = dData["time"].iloc[0]
-    prevSkipTime = 0
-    waitTime = 240 # 4 minutes
+    prev_time = d_data["time"].iloc[0]
+    prev_skip_time = 0
+    wait_time = 240 # 4 minutes # there are 5 readings per 5 minutes, but use 4 to make sure all are included
     
 
-    for id, time, *values in dData.itertuples():
+    for id, time, *values in d_data.itertuples():
         
         # Row does not have a valid time, skip
         if np.isnan(time):
@@ -231,36 +144,74 @@ def combineFromIntervals(dData):
             
            
         # Find the average of the accumulated data
-        if time > prevSkipTime + waitTime:
+        if time > prev_skip_time + wait_time:
             
             avgs = sums/nums
-            combinedData.append([prevTime, *avgs])
+            combined_data.append([prev_time, *avgs])
             
-            prevSkipTime = time
+            prev_skip_time = time
             
-            # Reset sum and num
+            # Reset sums and nums
             sums *= 0
             nums *= 0
         
         
-        prevTime = time
+        prev_time = time
     
     
-    return pd.DataFrame(combinedData, columns=["time", "tempIn", "tempOut", "batVolt", "light"])
-        
+    return pd.DataFrame(combined_data, columns=["time", "tempIn", "tempOut", "light", "batVolt"])
 
-#%% FETCH DRIVHUS DATA AND CLEAN FAULTY READINGS
-def drivhusData():
 
-    print("Henter data fra Drivhus")
-    dData = pd.DataFrame(fetchDrivhusData(firstID=19989))
+def interpolateDData(d_data: pd.DataFrame, resolution):
     
-    dData = cleanAllData(dData)
+    time = np.linspace(d_data['time'].iloc[0], d_data['time'].iloc[-1], resolution)
+    
+    new_data = pd.DataFrame({
+        "time": time,
+        "tempIn": np.interp(time, d_data['time'], d_data['tempIn']),
+        "tempOut": np.interp(time, d_data['time'], d_data['tempOut']),
+        "light": np.interp(time, d_data['time'], d_data['light']),
+        "batVolt": np.interp(time, d_data['time'], d_data['batVolt'])
+    })
+    
+    return new_data
 
-    dData.set_index('id', inplace=True)
+
+
+def addGroundTemp(d_data):
     
-    dData = combineFromIntervals(dData) # To be worked on, using all data for now
+    p = 86400 # seconds in a day
+    p_seasonal = 365 * p # seconds in a year
+    x = d_data['time']
+    # Daily variation + seasonal variation + linear trend + constant offset
+    tempGround = 3 * np.sin(2 * np.pi / p * (x - p/2)) \
+                    + 10 * np.sin(2 * np.pi / p_seasonal * (x-90)) \
+                    + (x - x.iloc[0])/p/8 \
+                    + 2
     
+    d_data['tempGround'] = tempGround
     
-    return dData
+    return d_data
+
+
+# FETCH DRIVHUS DATA AND CLEAN FAULTY READINGS
+def getDrivhusData(fileName: str = "drivhus.txt", **kwargs):
+
+    print("Henter data for Drivhus")
+    d_data = pd.read_csv(fileName, **kwargs)
+    d_data.columns = ["time", "tempIn", "tempOut", "light", "batVolt"]
+    
+    # Rense og behandle rå data
+    d_data = cleanAllData(d_data)
+    d_data = combineFromIntervals(d_data)
+    
+    resolution = len(d_data) * 5 # Øker gjennomsnitllig oppløsning med 5x
+    d_data = interpolateDData(d_data, resolution)
+    
+    d_data = addGroundTemp(d_data)
+    
+    return d_data
+
+
+
 
