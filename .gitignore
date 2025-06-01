@@ -162,5 +162,9 @@ cython_debug/
 #.idea/
 
 
+# VS Code and personal editor settings
+.vscode/
 Testing/
-MET_Secrets.py
+
+# macOS
+.DS-Store
