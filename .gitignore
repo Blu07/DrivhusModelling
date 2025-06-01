@@ -165,6 +165,7 @@ cython_debug/
 # VS Code and personal editor settings
 .vscode/
 Testing/
+innleveringToF/
 
 # macOS
 .DS-Store
